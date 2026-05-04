@@ -17,16 +17,19 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
-    # DB
+    # DB — dev: sqlite:///./backend.db | Azure Postgres example:
+    # postgresql+psycopg2://USER:PASSWORD@HOST.postgres.database.azure.com:5432/DBNAME?sslmode=require
     DATABASE_URL: str = "sqlite:///./backend.db"
 
     # Admin bootstrap
     BOOTSTRAP_ADMIN_EMAIL: str = "varshithagovindaswamy@gmail.com"
     BOOTSTRAP_ADMIN_PASSWORD: str = "Admin@12345"
 
-    # SendGrid
-    SENDGRID_API_KEY: str = ""
-    EMAIL_FROM: str = "no-reply@maverick.local"
+    # Azure Communication Services — Email (replaces SendGrid)
+    # Portal: Communication Services resource → Keys → Connection string
+    ACS_EMAIL_CONNECTION_STRING: str = ""
+    # Verified MailFrom address for ACS Email (linked domain or *.azurecomm.net sandbox)
+    EMAIL_FROM: str = ""
 
     # Azure Blob Storage
     AZURE_STORAGE_CONNECTION_STRING: str = ""

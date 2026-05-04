@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.schemas.certification import CertificationCreate, CertificationOut, DriveCreate, DriveOut
@@ -12,8 +13,27 @@ router = APIRouter()
 
 
 @router.get("/", response_model=list[CertificationOut])
-def list_certifications(db: Session = Depends(get_db), user: User = Depends(get_current_user)):  # noqa: ARG001
-    return db.query(Certification).order_by(Certification.provider.asc(), Certification.title.asc()).all()
+def list_certifications(
+    search: str | None = None,
+    category: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),  # noqa: ARG001
+):
+    q = db.query(Certification)
+    if search:
+        term = f"%{search}%"
+        q = q.filter(
+            or_(
+                Certification.title.ilike(term),
+                Certification.provider.ilike(term),
+                Certification.tags.ilike(term),
+                Certification.category.ilike(term),
+                Certification.description.ilike(term),
+            )
+        )
+    if category and category.lower() != "all":
+        q = q.filter(Certification.category.ilike(f"%{category}%"))
+    return q.order_by(Certification.category.asc(), Certification.title.asc()).all()
 
 
 @router.post("/", response_model=CertificationOut)
@@ -88,4 +108,3 @@ def create_drive(
     db.commit()
     db.refresh(drive)
     return drive
-

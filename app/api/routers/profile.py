@@ -5,8 +5,32 @@ from pydantic import BaseModel, EmailStr
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
+from app.models.enrollment import Enrollment, EnrollmentStatus
+from app.models.certification import Certification
 
 router = APIRouter()
+
+@router.get("/badges")
+def get_user_badges(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Fetch all badges the user has earned from completed certifications."""
+    completed_enrollments = db.query(Enrollment).filter(
+        Enrollment.user_id == user.id,
+        Enrollment.status == EnrollmentStatus.completed
+    ).all()
+    
+    badges = []
+    for enr in completed_enrollments:
+        c = db.query(Certification).filter(Certification.id == enr.certification_id).first()
+        if c and c.badge_image_url:
+            badges.append({
+                "id": c.id,
+                "title": c.title,
+                "provider": c.provider,
+                "badge_url": c.badge_image_url,
+                "earned_at": enr.updated_at.isoformat() if enr.updated_at else enr.created_at.isoformat()
+            })
+            
+    return {"badges": badges}
 
 
 class ProfileUpdate(BaseModel):

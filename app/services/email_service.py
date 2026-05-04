@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.email_log import EmailLog
+
+PROVIDER = "azure_communication"
+
+
+def _html_to_plain(html: str) -> str:
+    """Minimal HTML → plain text for ACS content.plainText."""
+    if not html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:8000] if len(text) > 8000 else text
 
 
 @dataclass(frozen=True)
@@ -23,24 +33,48 @@ def send_email(db: Session, *, to_email: str, subject: str, html_content: str, u
         to_email=to_email,
         subject=subject,
         body_preview=(html_content[:800] if html_content else None),
-        provider="sendgrid",
+        provider=PROVIDER,
         success=False,
     )
     try:
-        if not settings.SENDGRID_API_KEY:
-            raise RuntimeError("SENDGRID_API_KEY is not configured")
-        client = SendGridAPIClient(settings.SENDGRID_API_KEY)
-        message = Mail(from_email=settings.EMAIL_FROM, to_emails=to_email, subject=subject, html_content=html_content)
-        resp = client.send(message)
+        if not settings.ACS_EMAIL_CONNECTION_STRING:
+            raise RuntimeError("ACS_EMAIL_CONNECTION_STRING is not configured")
+        if not settings.EMAIL_FROM:
+            raise RuntimeError("EMAIL_FROM is not configured (verified sender in Azure Communication Services)")
+
+        from azure.communication.email import EmailClient
+
+        client = EmailClient.from_connection_string(settings.ACS_EMAIL_CONNECTION_STRING)
+        message = {
+            "senderAddress": settings.EMAIL_FROM,
+            "recipients": {"to": [{"address": to_email}]},
+            "content": {
+                "subject": subject,
+                "html": html_content,
+                "plainText": _html_to_plain(html_content) or subject,
+            },
+        }
+        poller = client.begin_send(message)
+        result = poller.result(timeout=120.0)
+
         provider_message_id = None
-        # SendGrid returns message id in headers sometimes; keep best-effort
-        if resp and hasattr(resp, "headers"):
-            provider_message_id = resp.headers.get("X-Message-Id") or resp.headers.get("x-message-id")
+        status = None
+        if isinstance(result, dict):
+            provider_message_id = result.get("id")
+            status = result.get("status")
+        else:
+            provider_message_id = getattr(result, "id", None)
+            status = getattr(result, "status", None)
+
+        if status and str(status).lower() not in ("succeeded", "success"):
+            err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
+            raise RuntimeError(str(err or result))
+
         log.success = True
-        log.provider_message_id = provider_message_id
+        log.provider_message_id = str(provider_message_id)[:200] if provider_message_id else None
         db.add(log)
         db.commit()
-        return EmailResult(success=True, provider_message_id=provider_message_id)
+        return EmailResult(success=True, provider_message_id=log.provider_message_id)
     except Exception as e:  # noqa: BLE001
         log.success = False
         log.error = str(e)

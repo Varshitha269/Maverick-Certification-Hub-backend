@@ -80,3 +80,9 @@ def try_generate_sas_url(blob_path: str, *, expires_in_minutes: int = 30) -> str
     except Exception:  # noqa: BLE001
         return None
 
+def stream_blob(blob_path: str):
+    client = _get_client()
+    blob_client = client.get_blob_client(container=settings.AZURE_STORAGE_CONTAINER, blob=blob_path)
+    stream = blob_client.download_blob()
+    return stream.chunks()
+

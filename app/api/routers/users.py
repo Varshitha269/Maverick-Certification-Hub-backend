@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 from app.api.schemas.user import UserOut, UserUpdate
@@ -19,6 +19,44 @@ def me(user: User = Depends(get_current_user)):
 def update_me(payload: UserUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.full_name is not None:
         user.full_name = payload.full_name
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.post("/me/avatar", response_model=UserOut)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    
+    import os
+    import uuid
+    from pathlib import Path
+    
+    # Create uploads directory if it doesn't exist
+    upload_dir = Path("uploads/avatars")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate unique filename
+    file_extension = Path(file.filename).suffix
+    unique_filename = f"{user.id}_{uuid.uuid4()}{file_extension}"
+    file_path = upload_dir / unique_filename
+    
+    # Save file
+    try:
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+    
+    # Store relative URL in database
+    user.avatar_url = f"/uploads/avatars/{unique_filename}"
     db.add(user)
     db.commit()
     db.refresh(user)

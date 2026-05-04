@@ -9,6 +9,7 @@ class UserOut(BaseModel):
     full_name: str | None
     role: UserRole
     is_active: bool
+    avatar_url: str | None
 
     model_config = {"from_attributes": True}
 

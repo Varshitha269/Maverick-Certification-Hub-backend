@@ -9,6 +9,12 @@ class CertificationCreate(BaseModel):
     estimated_hours: int | None = Field(default=None, ge=0)
     exam_cost: int | None = Field(default=None, ge=0)
     tags: str | None = Field(default=None, max_length=500)
+    category: str | None = Field(default=None, max_length=120)
+    duration: str | None = Field(default=None, max_length=80)
+    prerequisites: str | None = None
+    course_url: str | None = Field(default=None, max_length=800)
+    official_exam_url: str | None = Field(default=None, max_length=800)
+    resources_json: str | None = None
 
 
 class CertificationOut(CertificationCreate):
@@ -30,4 +36,3 @@ class DriveOut(DriveCreate):
     id: int
 
     model_config = {"from_attributes": True}
-
