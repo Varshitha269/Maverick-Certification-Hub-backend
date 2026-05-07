@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 from app.models.voucher import VoucherStatus
 
@@ -24,6 +25,9 @@ class VoucherOut(BaseModel):
     code: str
     status: VoucherStatus
     notes: str | None
+    created_at: datetime
+    updated_at: datetime | None
+    expires_at: str | None = None
 
     model_config = {"from_attributes": True}
 

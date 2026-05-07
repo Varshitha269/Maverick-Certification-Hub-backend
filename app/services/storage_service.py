@@ -52,6 +52,40 @@ def upload_bytes(*, data: bytes, content_type: str | None, filename: str, user_i
     return StorageObject(blob_path=blob_path, size_bytes=len(data), sha256=sha)
 
 
+def ensure_drive_repository_prefix(*, drive_id: int, drive_name: str) -> str:
+    """
+    BRD FR-2: provision a predictable "folder-like" structure in Blob.
+    Azure Blob Storage doesn't have real folders; we create zero-byte marker blobs.
+    Returns the repository prefix to store on the drive.
+    """
+    ensure_container()
+    safe = (drive_name or f"drive-{drive_id}").strip().replace(" ", "_").replace("/", "_")
+    prefix = f"drives/{drive_id}-{safe}"
+
+    markers = [
+        f"{prefix}/01_Registrations/.keep",
+        f"{prefix}/02_Attendance/.keep",
+        f"{prefix}/03_Assessments/.keep",
+        f"{prefix}/04_Vouchers/.keep",
+        f"{prefix}/99_Audit/.keep",
+    ]
+
+    client = _get_client()
+    for blob_path in markers:
+        blob_client = client.get_blob_client(container=settings.AZURE_STORAGE_CONTAINER, blob=blob_path)
+        try:
+            blob_client.upload_blob(
+                b"",
+                overwrite=True,
+                content_settings=ContentSettings(content_type="text/plain"),
+            )
+        except Exception:  # noqa: BLE001
+            # marker best-effort; don't fail the app on blob errors
+            pass
+
+    return prefix
+
+
 def get_blob_url(blob_path: str) -> str:
     client = _get_client()
     blob_client = client.get_blob_client(container=settings.AZURE_STORAGE_CONTAINER, blob=blob_path)

@@ -12,6 +12,7 @@ from app.api.api_v1 import api_router
 from app.core.config import settings
 from app.db.init_db import create_tables, ensure_bootstrap_admin
 from app.db.session import SessionLocal
+from app.services.notification_service import deliver_due_notification_emails
 from app.services.reminders import send_pending_and_overdue_reminders
 
 
@@ -23,6 +24,12 @@ def _start_scheduler() -> BackgroundScheduler:
             send_pending_and_overdue_reminders(db)
 
     scheduler.add_job(_job, "interval", minutes=settings.REMINDER_JOB_INTERVAL_MINUTES, id="reminders", replace_existing=True)
+
+    def _notification_email_job():
+        with SessionLocal() as db:
+            deliver_due_notification_emails(db)
+
+    scheduler.add_job(_notification_email_job, "interval", minutes=1, id="notification-emails", replace_existing=True)
     scheduler.start()
     return scheduler
 

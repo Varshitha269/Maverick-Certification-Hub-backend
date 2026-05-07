@@ -55,7 +55,7 @@ def send_email(db: Session, *, to_email: str, subject: str, html_content: str, u
             },
         }
         poller = client.begin_send(message)
-        result = poller.result(timeout=120.0)
+        result = poller.result(timeout=15.0)
 
         provider_message_id = None
         status = None

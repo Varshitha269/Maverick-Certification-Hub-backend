@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     REMINDER_JOB_INTERVAL_MINUTES: int = 60
     OVERDUE_AFTER_DAYS: int = 14
 
+    # Voucher security (BRD)
+    # Provide any strong secret; it will be derived to a Fernet key.
+    VOUCHER_ENCRYPTION_KEY: str = ""
+
 
 settings = Settings()
 

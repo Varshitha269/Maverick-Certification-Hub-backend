@@ -100,7 +100,7 @@ def ai_verify_certificate_upload(
     if not settings.AI_ENABLED:
         # Mock successful verification when AI is disabled
         return {
-            "candidate_name": user.name,
+            "candidate_name": user.full_name or user.email,
             "certification_title": "Mock Certification",
             "provider": "Mock Provider",
             "issued_on": dt.datetime.now().isoformat(),
@@ -110,7 +110,7 @@ def ai_verify_certificate_upload(
 
     # Pass the filename as "text" to the AI to simulate OCR extraction 
     # since we don't have a backend image processing pipeline set up.
-    mock_text = f"Certificate File: {upload.original_filename}. This certifies that {user.name} has completed the certification."
+    mock_text = f"Certificate File: {upload.original_filename}. This certifies that {user.full_name or user.email} has completed the certification."
     info = extract_certificate_text_info(mock_text)
     
     # If the confidence is somehow low or 0, we can boost it for the sake of the mock flow

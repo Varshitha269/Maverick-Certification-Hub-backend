@@ -39,5 +39,13 @@ class CertificationDrive(Base, TimestampMixin):
     eligibility_rules: Mapped[str | None] = mapped_column(Text, nullable=True)
     voucher_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # BRD drive metadata (added safely; existing rows remain valid)
+    sponsor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    owner_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    policy_url: Mapped[str | None] = mapped_column(String(800), nullable=True)
+    target_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="open", nullable=False, index=True)  # open/closed
+    repository_prefix: Mapped[str | None] = mapped_column(String(300), nullable=True)  # blob folder prefix
+
     certification = relationship("Certification", back_populates="drives")
     enrollments = relationship("Enrollment", back_populates="drive", cascade="all, delete-orphan")

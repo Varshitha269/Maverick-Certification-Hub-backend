@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field
 
 from app.models.user import UserRole
+import datetime as dt
 
 
 class UserOut(BaseModel):
@@ -10,8 +11,19 @@ class UserOut(BaseModel):
     role: UserRole
     is_active: bool
     avatar_url: str | None
+    created_at: dt.datetime | None = None
+    updated_at: dt.datetime | None = None
 
     model_config = {"from_attributes": True}
+
+
+class AdminUserOut(UserOut):
+    last_login_at: dt.datetime | None = None
+    enrollment_count: int = 0
+    registration_count: int = 0
+    completed_count: int = 0
+    eligibility_attempts: int = 0
+    avg_eligibility_score: float | None = None
 
 
 class UserUpdate(BaseModel):

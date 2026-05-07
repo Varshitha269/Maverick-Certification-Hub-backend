@@ -11,10 +11,108 @@ from app.models.upload import UploadedFile
 from app.models.user import User
 from app.models.certification import Certification
 from app.models.voucher import Voucher
+from app.models.notification import Notification
 from collections import defaultdict
 
 
 router = APIRouter()
+
+
+@router.get("/home")
+def home_overview(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    available = db.query(func.count(Certification.id)).scalar() or 0
+    enrolled = (
+        db.query(func.count(Enrollment.id))
+        .filter(Enrollment.user_id == user.id, Enrollment.status != EnrollmentStatus.saved_for_later)
+        .scalar()
+        or 0
+    )
+    completed_enrollments = (
+        db.query(func.count(Enrollment.id))
+        .filter(Enrollment.user_id == user.id, Enrollment.status == EnrollmentStatus.completed)
+        .scalar()
+        or 0
+    )
+    task_total = db.query(func.count(Task.id)).filter(Task.user_id == user.id).scalar() or 0
+    task_done = (
+        db.query(func.count(Task.id))
+        .filter(Task.user_id == user.id, Task.status == TaskStatus.done)
+        .scalar()
+        or 0
+    )
+    open_tasks = max(0, task_total - task_done)
+    completion_rate = round((task_done / task_total) * 100) if task_total else 0
+
+    notifications = (
+        db.query(Notification)
+        .filter(Notification.user_id == user.id)
+        .order_by(Notification.created_at.desc())
+        .limit(5)
+        .all()
+    )
+    recent_enrollments = (
+        db.query(Enrollment)
+        .filter(Enrollment.user_id == user.id)
+        .order_by(Enrollment.created_at.desc())
+        .limit(5)
+        .all()
+    )
+
+    activity = [
+        {
+            "type": "notification",
+            "title": n.title,
+            "message": n.message,
+            "content_format": n.content_format,
+            "created_at": n.created_at,
+            "link_url": n.link_url,
+        }
+        for n in notifications
+    ]
+    for enrollment in recent_enrollments:
+        cert = db.query(Certification).filter(Certification.id == enrollment.certification_id).first()
+        if cert:
+            activity.append(
+                {
+                    "type": "enrollment",
+                    "title": cert.title,
+                    "message": f"Enrollment status: {enrollment.status.value.replace('_', ' ')}",
+                    "created_at": enrollment.created_at,
+                    "link_url": f"/learning/{enrollment.id}",
+                }
+            )
+    activity = sorted(activity, key=lambda item: item["created_at"], reverse=True)[:6]
+
+    return {
+        "summary": {
+            "available": available,
+            "enrolled": enrolled,
+            "tasks": open_tasks,
+            "completion_rate": completion_rate,
+            "completed": completed_enrollments,
+        },
+        "quick_actions": [
+            {"label": "Browse certifications", "to": "/certifications"},
+            {"label": "Upload documents", "to": "/uploads"},
+            {"label": "View tasks", "to": "/tasks"},
+            {"label": "Open Power BI view", "to": "/dashboard"},
+        ],
+        "recent_activity": activity,
+        "getting_started": [
+            "Browse certifications and filter by category.",
+            "Use AI eligibility guidance before you enroll.",
+            "Enroll and complete the generated prerequisite tasks.",
+            "Upload required documents for admin review.",
+            "Wait for approval and voucher assignment.",
+            "Download voucher, take the exam, and track results.",
+        ],
+        "tool_stack": [
+            {"name": "Azure OpenAI", "area": "Eligibility explanations, task plans, certificate verification"},
+            {"name": "Power Apps", "area": "Low-code approval and mobile document intake workflow"},
+            {"name": "Power BI", "area": "Executive analytics for progress, success rate, voucher usage"},
+            {"name": "Azure Blob Storage", "area": "Document and certificate storage"},
+        ],
+    }
 
 
 @router.get("/heatmap")
@@ -210,16 +308,14 @@ def my_dashboard(db: Session = Depends(get_db), user: User = Depends(get_current
     for enr in active_enrollments:
         c = db.query(Certification).filter(Certification.id == enr.certification_id).first()
         if c:
-            # calculate a mock due date based on created_at or updated_at
-            # assuming duration is ~30 days
-            due_date = (enr.created_at + timedelta(days=30)).strftime("%m/%d/%Y")
             current_certs.append({
                 "id": c.id,
+                "enrollment_id": enr.id,
                 "title": c.title,
                 "provider": c.provider,
                 "status": "In Progress" if enr.status == EnrollmentStatus.in_progress else "Enrolled",
                 "progress": enr.progress_percent or 0,
-                "due_date": due_date
+                "target_completion_date": enr.target_completion_date,
             })
 
     return {

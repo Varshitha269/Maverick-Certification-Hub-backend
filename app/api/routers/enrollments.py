@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -7,6 +9,7 @@ from app.core.deps import get_current_user, require_role
 from app.db.session import get_db
 from app.models.certification import Certification
 from app.models.certification import CertificationDrive
+from app.models.eligibility import EligibilityTestAttempt
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.user import User, UserRole
 from app.models.task import Task, TaskStatus
@@ -16,6 +19,58 @@ from app.models.notification import NotificationType
 
 
 router = APIRouter()
+
+
+def _ensure_default_tasks(db: Session, enrollment: Enrollment, certification: Certification) -> None:
+    existing = db.query(Task).filter(Task.enrollment_id == enrollment.id).count()
+    if existing:
+        return
+
+    now = datetime.now(timezone.utc)
+    defaults = [
+        (
+            "Prerequisites assessment",
+            f"Confirm that you meet the prerequisites for {certification.title}. Use AI eligibility guidance if anything is unclear.",
+            1,
+            3,
+        ),
+        (
+            "Upload required documents",
+            "Upload ID proof, education certificates, and experience letters in the Uploads tab.",
+            1,
+            5,
+        ),
+        (
+            "Manager approval",
+            "Request manager approval so admin can review and approve the certification application.",
+            2,
+            7,
+        ),
+        (
+            "Training plan",
+            "Complete the recommended learning path and track study progress.",
+            3,
+            14,
+        ),
+        (
+            "Voucher readiness review",
+            "Confirm all documents and approvals are complete before voucher assignment.",
+            2,
+            21,
+        ),
+    ]
+    for title, description, priority, due_offset in defaults:
+        db.add(
+            Task(
+                user_id=enrollment.user_id,
+                enrollment_id=enrollment.id,
+                title=title,
+                description=description,
+                status=TaskStatus.todo,
+                priority=priority,
+                due_date=(now + timedelta(days=due_offset)).date().isoformat(),
+            )
+        )
 
 
 @router.get("/me", response_model=list[EnrollmentOut])
@@ -29,7 +84,19 @@ def select_certification(payload: EnrollmentCreate, db: Session = Depends(get_db
     if not cert:
         raise HTTPException(status_code=404, detail="Certification not found")
 
-    # No eligibility check — anyone can enroll or save for later
+    if payload.status != EnrollmentStatus.saved_for_later:
+        passed_attempt = (
+            db.query(EligibilityTestAttempt)
+            .filter(
+                EligibilityTestAttempt.user_id == user.id,
+                EligibilityTestAttempt.certification_id == payload.certification_id,
+                EligibilityTestAttempt.passed == True,  # noqa: E712
+            )
+            .order_by(EligibilityTestAttempt.created_at.desc(), EligibilityTestAttempt.id.desc())
+            .first()
+        )
+        if not passed_attempt:
+            raise HTTPException(status_code=400, detail="Pass the certification eligibility test before enrolling")
 
     existing = (
         db.query(Enrollment)
@@ -41,6 +108,7 @@ def select_certification(payload: EnrollmentCreate, db: Session = Depends(get_db
         if existing.status == EnrollmentStatus.saved_for_later and payload.status == EnrollmentStatus.selected:
             existing.status = EnrollmentStatus.selected
             db.add(existing)
+            _ensure_default_tasks(db, existing, cert)
             db.commit()
             db.refresh(existing)
             
@@ -67,6 +135,9 @@ def select_certification(payload: EnrollmentCreate, db: Session = Depends(get_db
     db.add(enrollment)
     db.commit()
     db.refresh(enrollment)
+    if payload.status != EnrollmentStatus.saved_for_later:
+        _ensure_default_tasks(db, enrollment, cert)
+        db.commit()
 
     # Create notification based on status
     is_saved = payload.status == EnrollmentStatus.saved_for_later

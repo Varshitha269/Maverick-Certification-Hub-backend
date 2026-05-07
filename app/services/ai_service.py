@@ -97,3 +97,74 @@ Constraints:
         return []
     return [t for t in tasks if isinstance(t, dict)]
 
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def extract_skills_from_text(*, text: str) -> dict:
+    """
+    BRD AI: resume/profile skill extraction (no training; Azure OpenAI).
+    Returns JSON: { "skills": [{ "name": str, "level": str|None, "evidence": str|None }], "summary": str }
+    """
+    client = _client()
+    prompt = f"""
+Extract professional skills from the text below.
+Return JSON with keys:
+- skills: array of {{name, level(optional: beginner/intermediate/advanced), evidence(optional short quote)}}
+- summary: 1-2 sentence summary of the profile
+
+Text:
+{text}
+""".strip()
+    resp = client.chat.completions.create(
+        model=settings.AZURE_OPENAI_DEPLOYMENT,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": "You extract skills into structured JSON. Output ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = resp.choices[0].message.content or "{}"
+    import json  # noqa: PLC0415
+
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        return {"skills": [], "summary": ""}
+    return {"skills": parsed.get("skills") or [], "summary": parsed.get("summary") or ""}
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def generate_drive_exec_summary(*, drive_name: str, stats: dict) -> dict:
+    """
+    BRD AI: admin-friendly executive summary for a drive.
+    Input stats should be small JSON.
+    """
+    client = _client()
+    prompt = f"""
+Write an executive-ready summary for the certification drive.
+Return JSON with keys: summary (string), risks (array of strings), next_actions (array of strings).
+
+Drive: {drive_name}
+Stats JSON:
+{stats}
+""".strip()
+    resp = client.chat.completions.create(
+        model=settings.AZURE_OPENAI_DEPLOYMENT,
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "You produce concise leadership summaries. Output ONLY valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = resp.choices[0].message.content or "{}"
+    import json  # noqa: PLC0415
+
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        return {"summary": "", "risks": [], "next_actions": []}
+    return {
+        "summary": parsed.get("summary") or "",
+        "risks": parsed.get("risks") or [],
+        "next_actions": parsed.get("next_actions") or [],
+    }
+
