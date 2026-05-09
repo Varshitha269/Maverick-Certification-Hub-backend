@@ -24,6 +24,41 @@ except Exception as e:
     DB_AVAILABLE = False
 
 # Tool definitions
+def _cert_to_dict(cert: Certification, include_details: bool = False) -> Dict[str, Any]:
+    result = {
+        "id": cert.id,
+        "title": cert.title,
+        "provider": cert.provider,
+        "category": cert.category,
+        "level": cert.level,
+        "description": cert.description,
+        "estimated_hours": cert.estimated_hours,
+        "duration": cert.duration,
+        "tags": cert.tags,
+    }
+    if include_details:
+        result.update(
+            {
+                "prerequisites": cert.prerequisites,
+                "course_url": cert.course_url,
+                "official_exam_url": cert.official_exam_url,
+                "resources": _parse_resources(cert.resources_json),
+                "exam_cost": cert.exam_cost,
+                "badge_image_url": cert.badge_image_url,
+            }
+        )
+    return result
+
+
+def _parse_resources(resources_json: str | None) -> Any:
+    if not resources_json:
+        return []
+    try:
+        return json.loads(resources_json)
+    except json.JSONDecodeError:
+        return resources_json
+
+
 def get_available_tools():
     """Define available MCP tools"""
     return [
@@ -74,9 +109,9 @@ def get_available_tools():
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["not_started", "in_progress", "saved_for_later"],
+                        "enum": ["selected", "in_progress", "saved_for_later"],
                         "description": "Initial enrollment status",
-                        "default": "not_started"
+                        "default": "selected"
                     }
                 },
                 "required": ["user_email", "certification_id"]
@@ -94,7 +129,7 @@ def get_available_tools():
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["not_started", "in_progress", "saved_for_later", "completed"],
+                        "enum": ["selected", "in_progress", "saved_for_later", "completed", "cancelled"],
                         "description": "New status"
                     }
                 },
@@ -200,19 +235,7 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 
             certifications = query.all()
             
-            result = [
-                {
-                    "id": cert.id,
-                    "title": cert.title,
-                    "provider": cert.provider,
-                    "category": cert.category,
-                    "level": cert.level,
-                    "description": cert.description,
-                    "duration_hours": cert.duration_hours,
-                    "difficulty": cert.difficulty
-                }
-                for cert in certifications
-            ]
+            result = [_cert_to_dict(cert) for cert in certifications]
             
             return {
                 "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
@@ -229,21 +252,7 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                     "isError": True
                 }
             
-            result = {
-                "id": cert.id,
-                "title": cert.title,
-                "provider": cert.provider,
-                "category": cert.category,
-                "level": cert.level,
-                "description": cert.description,
-                "duration_hours": cert.duration_hours,
-                "difficulty": cert.difficulty,
-                "prerequisites": cert.prerequisites,
-                "exam_info": cert.exam_info,
-                "course_url": cert.course_url,
-                "official_exam_url": cert.official_exam_url,
-                "resource_urls": cert.resource_urls
-            }
+            result = _cert_to_dict(cert, include_details=True)
             
             return {
                 "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
@@ -253,7 +262,7 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         elif name == "enroll_user":
             user_email = arguments["user_email"]
             cert_id = arguments["certification_id"]
-            status = arguments.get("status", "not_started")
+            status = arguments.get("status", "selected")
             
             # Find user
             user = db.query(User).filter(User.email == user_email).first()
@@ -457,14 +466,13 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 "certification_id": cert.id,
                 "title": cert.title,
                 "prerequisites": cert.prerequisites,
-                "exam_info": cert.exam_info,
                 "study_resources": {
                     "primary_course": cert.course_url,
                     "official_exam": cert.official_exam_url,
-                    "additional_resources": cert.resource_urls
+                    "additional_resources": _parse_resources(cert.resources_json)
                 },
-                "estimated_duration_hours": cert.duration_hours,
-                "difficulty_level": cert.difficulty
+                "estimated_hours": cert.estimated_hours,
+                "duration": cert.duration
             }
             
             return {
@@ -506,14 +514,12 @@ def get_available_resources():
 # Simple MCP server implementation
 async def main():
     """Run MCP server"""
-    print("Maverick Certification Hub MCP Server")
-    print("Available tools:")
+    print("Maverick Certification Hub MCP Server", file=sys.stderr)
+    print("Available tools:", file=sys.stderr)
     for tool in get_available_tools():
-        print(f"  - {tool['name']}: {tool['description']}")
+        print(f"  - {tool['name']}: {tool['description']}", file=sys.stderr)
     
     # Simple JSON-RPC server for testing
-    import sys
-    
     try:
         while True:
             line = sys.stdin.readline()
@@ -524,7 +530,34 @@ async def main():
                 request = json.loads(line.strip())
                 method = request.get("method")
                 
-                if method == "tools/list":
+                if method == "initialize":
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": {
+                            "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
+                            "capabilities": {
+                                "tools": {},
+                                "resources": {}
+                            },
+                            "serverInfo": {
+                                "name": "maverick-certification-hub",
+                                "version": "1.0.0"
+                            }
+                        }
+                    }
+
+                elif method == "notifications/initialized":
+                    continue
+
+                elif method == "ping":
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": {}
+                    }
+
+                elif method == "tools/list":
                     response = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),

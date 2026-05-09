@@ -1,20 +1,632 @@
 import datetime as dt
+import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
+from openai import AzureOpenAI
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.api.routers.enrollments import _ensure_default_tasks
 from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.certification import Certification
+from app.models.eligibility import EligibilityTestAttempt
 from app.models.enrollment import Enrollment
+from app.models.enrollment import EnrollmentStatus
+from app.models.registration import Registration
 from app.models.task import Task
 from app.models.user import User
+from app.models.user import UserRole
 from app.models.upload import UploadedFile
+from app.models.voucher import Voucher
 from app.services.ai_service import extract_certificate_text_info, generate_task_plan
 
 
 router = APIRouter()
+
+
+def _cert_summary(cert: Certification) -> str:
+    parts = [
+        f"{cert.title} by {cert.provider}",
+        f"level: {cert.level or 'not specified'}",
+        f"category: {cert.category or 'not specified'}",
+    ]
+    if cert.duration:
+        parts.append(f"duration: {cert.duration}")
+    if cert.estimated_hours:
+        parts.append(f"estimated hours: {cert.estimated_hours}")
+    return ", ".join(parts)
+
+
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else value
+
+
+def _cert_payload(cert: Certification) -> dict:
+    return {
+        "id": cert.id,
+        "title": cert.title,
+        "provider": cert.provider,
+        "category": cert.category,
+        "level": cert.level,
+        "duration": cert.duration,
+        "estimated_hours": cert.estimated_hours,
+        "description": cert.description,
+        "prerequisites": cert.prerequisites,
+        "course_url": cert.course_url,
+        "official_exam_url": cert.official_exam_url,
+    }
+
+
+def _enrollment_payload(db: Session, enrollment: Enrollment) -> dict:
+    cert = db.query(Certification).filter(Certification.id == enrollment.certification_id).first()
+    return {
+        "id": enrollment.id,
+        "certification_id": enrollment.certification_id,
+        "certification": cert.title if cert else f"Certification #{enrollment.certification_id}",
+        "status": _enum_value(enrollment.status),
+        "progress_percent": enrollment.progress_percent,
+        "target_completion_date": enrollment.target_completion_date,
+        "admin_review_requested": enrollment.admin_review_requested,
+    }
+
+
+def _user_payload(user: User) -> dict:
+    return {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "role": _enum_value(user.role),
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+    }
+
+
+def _available_tools(user: User) -> list[dict]:
+    tools = [
+        {"name": "list_certifications", "role": "user", "examples": ["list azure certifications", "show available certifications"]},
+        {"name": "get_certification_details", "role": "user", "examples": ["requirements for AZ-900", "details for certification 15"]},
+        {"name": "enroll_self", "role": "user", "examples": ["enroll me in certification 15", "save AWS Cloud Practitioner for later"]},
+        {"name": "list_my_enrollments", "role": "user", "examples": ["my enrollments", "show my progress"]},
+        {"name": "list_my_vouchers", "role": "user", "examples": ["my vouchers"]},
+    ]
+    if user.role == UserRole.admin:
+        tools.extend(
+            [
+                {"name": "admin_metrics", "role": "admin", "examples": ["admin metrics", "dashboard overview"]},
+                {"name": "admin_list_users", "role": "admin", "examples": ["list users", "show inactive users"]},
+                {"name": "admin_list_enrollments", "role": "admin", "examples": ["list all enrollments"]},
+                {"name": "admin_list_registrations", "role": "admin", "examples": ["list registrations", "pending registrations"]},
+                {"name": "admin_list_vouchers", "role": "admin", "examples": ["list vouchers"]},
+            ]
+        )
+    return tools
+
+
+def _azure_chat_client() -> AzureOpenAI:
+    if not settings.AZURE_OPENAI_ENDPOINT or not settings.AZURE_OPENAI_API_KEY:
+        raise RuntimeError("Azure OpenAI is not configured")
+    return AzureOpenAI(
+        api_key=settings.AZURE_OPENAI_API_KEY,
+        api_version=settings.AZURE_OPENAI_API_VERSION,
+        azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+    )
+
+
+def _tool_schemas(user: User) -> list[dict]:
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_available_tools",
+                "description": "Show what actions the assistant can perform for the current user's role.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_certifications",
+                "description": "Search or list certifications visible to users.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search text such as Azure, AWS, Python, testing, or a provider name."},
+                        "category": {"type": "string", "description": "Optional exact category filter."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_certification_details",
+                "description": "Get prerequisites, links, and details for one certification.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "certification_id": {"type": "integer", "description": "Certification id if known."},
+                        "query": {"type": "string", "description": "Certification name or search text if id is unknown."},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "enroll_self",
+                "description": "Enroll the current user in a certification, or save it for later.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "certification_id": {"type": "integer", "description": "Certification id if known."},
+                        "query": {"type": "string", "description": "Certification name or search text if id is unknown."},
+                        "status": {
+                            "type": "string",
+                            "enum": ["selected", "saved_for_later"],
+                            "description": "Use saved_for_later only when the user asks to save/bookmark/review later.",
+                            "default": "selected",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_my_enrollments",
+                "description": "List the current user's certification enrollments and progress.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_my_vouchers",
+                "description": "List vouchers assigned to the current user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                    },
+                },
+            },
+        },
+    ]
+    if user.role == UserRole.admin:
+        schemas.extend(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_metrics",
+                        "description": "Get admin dashboard metrics and totals.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_list_users",
+                        "description": "List users for admin review.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Optional email/name search."},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_list_enrollments",
+                        "description": "List recent enrollments across all users.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "user_id": {"type": "integer"},
+                                "certification_id": {"type": "integer"},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_list_registrations",
+                        "description": "List BRD registrations across candidates.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "status": {"type": "string", "description": "Optional registration status."},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_list_vouchers",
+                        "description": "List vouchers across users.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "user_id": {"type": "integer"},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                        },
+                    },
+                },
+            ]
+        )
+    return schemas
+
+
+def _response(tool: str, text: str, data=None) -> dict:
+    return {"response": text, "tool": tool, "data": data}
+
+
+def _extract_id(message: str) -> int | None:
+    match = re.search(r"\b(?:id|certification|cert)\s*#?\s*(\d+)\b", message.lower())
+    if match:
+        return int(match.group(1))
+    numbers = re.findall(r"\b\d+\b", message)
+    return int(numbers[0]) if numbers else None
+
+
+def _find_certification(db: Session, message: str) -> Certification | None:
+    cert_id = _extract_id(message)
+    if cert_id:
+        cert = db.query(Certification).filter(Certification.id == cert_id).first()
+        if cert:
+            return cert
+
+    ignore = {
+        "show", "list", "cert", "certification", "certifications", "course", "courses", "details",
+        "requirements", "requirement", "resources", "resource", "exam", "enroll", "save", "later",
+        "me", "in", "for", "the", "about", "what", "are", "all", "available",
+    }
+    words = [word for word in re.findall(r"[a-zA-Z0-9+.#-]+", message.lower()) if len(word) >= 2 and word not in ignore]
+    if not words:
+        return None
+
+    filters = []
+    for word in words[:8]:
+        like = f"%{word}%"
+        filters.extend(
+            [
+                Certification.title.ilike(like),
+                Certification.provider.ilike(like),
+                Certification.category.ilike(like),
+                Certification.tags.ilike(like),
+            ]
+        )
+    return db.query(Certification).filter(or_(*filters)).order_by(Certification.id.asc()).first()
+
+
+def _safe_limit(value, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, maximum))
+
+
+def _execute_chat_tool(name: str, args: dict, db: Session, user: User) -> dict:
+    if name not in {tool["function"]["name"] for tool in _tool_schemas(user)}:
+        raise HTTPException(status_code=403, detail=f"Tool not allowed for this role: {name}")
+
+    if name == "list_available_tools":
+        return _response("list_available_tools", "Available tools for this role.", _available_tools(user))
+
+    if name == "list_certifications":
+        limit = _safe_limit(args.get("limit"), 10, 25)
+        query = (args.get("query") or "").strip()
+        category = (args.get("category") or "").strip()
+        q = db.query(Certification)
+        if category:
+            q = q.filter(Certification.category.ilike(category))
+        if query:
+            filters = []
+            for word in re.findall(r"[a-zA-Z0-9+.#-]+", query.lower())[:8]:
+                like = f"%{word}%"
+                filters.extend(
+                    [
+                        Certification.title.ilike(like),
+                        Certification.provider.ilike(like),
+                        Certification.category.ilike(like),
+                        Certification.tags.ilike(like),
+                    ]
+                )
+            if filters:
+                q = q.filter(or_(*filters))
+        rows = q.order_by(Certification.id.asc()).limit(limit).all()
+        data = [_cert_payload(cert) for cert in rows]
+        return _response("list_certifications", f"Found {len(data)} certification(s).", data)
+
+    if name == "get_certification_details":
+        cert = None
+        if args.get("certification_id"):
+            cert = db.query(Certification).filter(Certification.id == int(args["certification_id"])).first()
+        if not cert and args.get("query"):
+            cert = _find_certification(db, str(args["query"]))
+        if not cert:
+            return _response("get_certification_details", "Certification not found.", None)
+        return _response("get_certification_details", f"Details for {cert.title}.", _cert_payload(cert))
+
+    if name == "enroll_self":
+        cert = None
+        if args.get("certification_id"):
+            cert = db.query(Certification).filter(Certification.id == int(args["certification_id"])).first()
+        if not cert and args.get("query"):
+            cert = _find_certification(db, str(args["query"]))
+        if not cert:
+            return _response("enroll_self", "Certification not found. Ask the user which certification they mean.", None)
+
+        status_raw = args.get("status") or "selected"
+        status = EnrollmentStatus.saved_for_later if status_raw == "saved_for_later" else EnrollmentStatus.selected
+        existing = (
+            db.query(Enrollment)
+            .filter(Enrollment.user_id == user.id, Enrollment.certification_id == cert.id)
+            .first()
+        )
+        if existing:
+            return _response("enroll_self", "User already has an enrollment for this certification.", _enrollment_payload(db, existing))
+
+        if status != EnrollmentStatus.saved_for_later:
+            passed_attempt = (
+                db.query(EligibilityTestAttempt)
+                .filter(
+                    EligibilityTestAttempt.user_id == user.id,
+                    EligibilityTestAttempt.certification_id == cert.id,
+                    EligibilityTestAttempt.passed == True,  # noqa: E712
+                )
+                .order_by(EligibilityTestAttempt.created_at.desc(), EligibilityTestAttempt.id.desc())
+                .first()
+            )
+            if not passed_attempt:
+                return _response(
+                    "enroll_self",
+                    "Eligibility test must be passed before enrollment. Offer to save for later.",
+                    {"certification": _cert_payload(cert), "requires_eligibility_test": True},
+                )
+
+        enrollment = Enrollment(user_id=user.id, certification_id=cert.id, status=status)
+        db.add(enrollment)
+        db.commit()
+        db.refresh(enrollment)
+        if status != EnrollmentStatus.saved_for_later:
+            _ensure_default_tasks(db, enrollment, cert)
+            db.commit()
+            db.refresh(enrollment)
+        return _response("enroll_self", "Enrollment action completed.", _enrollment_payload(db, enrollment))
+
+    if name == "list_my_enrollments":
+        limit = _safe_limit(args.get("limit"), 20, 50)
+        rows = (
+            db.query(Enrollment)
+            .filter(Enrollment.user_id == user.id)
+            .order_by(Enrollment.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return _response("list_my_enrollments", f"Found {len(rows)} enrollment(s).", [_enrollment_payload(db, row) for row in rows])
+
+    if name == "list_my_vouchers":
+        limit = _safe_limit(args.get("limit"), 20, 50)
+        rows = db.query(Voucher).filter(Voucher.user_id == user.id).order_by(Voucher.created_at.desc()).limit(limit).all()
+        data = [
+            {
+                "id": row.id,
+                "certification_id": row.certification_id,
+                "status": _enum_value(row.status),
+                "code": row.masked_code or row.code,
+                "expires_at": row.expires_at,
+            }
+            for row in rows
+        ]
+        return _response("list_my_vouchers", f"Found {len(data)} voucher(s).", data)
+
+    if name == "admin_metrics":
+        data = {
+            "users": db.query(func.count(User.id)).scalar() or 0,
+            "active_users": db.query(func.count(User.id)).filter(User.is_active == True).scalar() or 0,  # noqa: E712
+            "certifications": db.query(func.count(Certification.id)).scalar() or 0,
+            "enrollments": db.query(func.count(Enrollment.id)).scalar() or 0,
+            "registrations": db.query(func.count(Registration.id)).scalar() or 0,
+            "vouchers": db.query(func.count(Voucher.id)).scalar() or 0,
+            "tasks": db.query(func.count(Task.id)).scalar() or 0,
+        }
+        return _response("admin_metrics", "Admin metrics loaded.", data)
+
+    if name == "admin_list_users":
+        limit = _safe_limit(args.get("limit"), 25, 50)
+        query = (args.get("query") or "").strip()
+        q = db.query(User)
+        if query:
+            like = f"%{query}%"
+            q = q.filter(or_(User.email.ilike(like), User.full_name.ilike(like)))
+        rows = q.order_by(User.created_at.desc()).limit(limit).all()
+        return _response("admin_list_users", f"Found {len(rows)} user(s).", [_user_payload(row) for row in rows])
+
+    if name == "admin_list_enrollments":
+        limit = _safe_limit(args.get("limit"), 25, 50)
+        q = db.query(Enrollment)
+        if args.get("user_id") is not None:
+            q = q.filter(Enrollment.user_id == int(args["user_id"]))
+        if args.get("certification_id") is not None:
+            q = q.filter(Enrollment.certification_id == int(args["certification_id"]))
+        rows = q.order_by(Enrollment.created_at.desc()).limit(limit).all()
+        return _response("admin_list_enrollments", f"Found {len(rows)} enrollment(s).", [_enrollment_payload(db, row) for row in rows])
+
+    if name == "admin_list_registrations":
+        limit = _safe_limit(args.get("limit"), 25, 50)
+        q = db.query(Registration)
+        if args.get("status"):
+            q = q.filter(Registration.status == str(args["status"]))
+        rows = q.order_by(Registration.created_at.desc()).limit(limit).all()
+        data = [
+            {
+                "id": row.id,
+                "candidate_email": row.candidate_email,
+                "candidate_name": row.candidate_name,
+                "drive_id": row.drive_id,
+                "status": _enum_value(row.status),
+                "slot": row.slot,
+            }
+            for row in rows
+        ]
+        return _response("admin_list_registrations", f"Found {len(data)} registration(s).", data)
+
+    if name == "admin_list_vouchers":
+        limit = _safe_limit(args.get("limit"), 25, 50)
+        q = db.query(Voucher)
+        if args.get("user_id") is not None:
+            q = q.filter(Voucher.user_id == int(args["user_id"]))
+        rows = q.order_by(Voucher.created_at.desc()).limit(limit).all()
+        data = [
+            {
+                "id": row.id,
+                "user_id": row.user_id,
+                "certification_id": row.certification_id,
+                "status": _enum_value(row.status),
+                "code": row.masked_code or row.code,
+            }
+            for row in rows
+        ]
+        return _response("admin_list_vouchers", f"Found {len(data)} voucher(s).", data)
+
+    raise HTTPException(status_code=400, detail=f"Unknown tool: {name}")
+
+
+@router.post("/chat")
+def ai_chat(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Role-aware AI tool caller for the in-app assistant.
+    Azure OpenAI chooses from backend-approved tools; the backend executes
+    only tools allowed for the authenticated user's role.
+    Body: { "message": "...", "history": [{ "role": "...", "content": "..." }] }
+    """
+    if not settings.AI_ENABLED:
+        raise HTTPException(status_code=503, detail="AI is disabled. Set AI_ENABLED=true.")
+    if (settings.AI_PROVIDER or "").strip().lower() != "azure_openai":
+        raise HTTPException(status_code=503, detail="Real chat tool-calling requires AI_PROVIDER=azure_openai.")
+
+    message = (payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Missing 'message'")
+
+    history = payload.get("history") or []
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the Maverick Certification Hub assistant. "
+                "Use tools whenever the user asks for application data or actions. "
+                "Do not invent IDs, users, enrollments, vouchers, registrations, or certification data. "
+                "The backend exposes only tools allowed for this authenticated user's role. "
+                f"Current user: {user.email}; role: {user.role.value}."
+            ),
+        }
+    ]
+    for item in history[-8:]:
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
+    client = _azure_chat_client()
+    schemas = _tool_schemas(user)
+    try:
+        first = client.chat.completions.create(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            tools=schemas,
+            tool_choice="auto",
+            max_completion_tokens=1200,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    assistant = first.choices[0].message
+    tool_calls = assistant.tool_calls or []
+    if not tool_calls:
+        return _response("none", assistant.content or "I could not decide which tool to use.", None)
+
+    assistant_message = {
+        "role": "assistant",
+        "content": assistant.content,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": call.type,
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in tool_calls
+        ],
+    }
+    followup_messages = [*messages, assistant_message]
+    executed = []
+    for call in tool_calls:
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        result = _execute_chat_tool(call.function.name, args, db, user)
+        executed.append({"name": call.function.name, "arguments": args, "result": result})
+        followup_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result, default=str),
+            }
+        )
+
+    try:
+        final = client.chat.completions.create(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                *followup_messages,
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize the tool result for the user. Be concise. "
+                        "If the tool performed an action, state the outcome clearly. "
+                        "If data is empty, say so and suggest the next useful action."
+                    ),
+                },
+            ],
+            max_completion_tokens=1200,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {
+        "response": final.choices[0].message.content or executed[-1]["result"]["response"],
+        "tool": executed[-1]["name"] if executed else None,
+        "tool_calls": executed,
+        "data": executed[-1]["result"].get("data") if executed else None,
+    }
 
 
 @router.post("/certificate/extract")
@@ -24,7 +636,10 @@ def ai_extract_certificate(payload: dict, user: User = Depends(get_current_user)
     text = (payload.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text'")
-    info = extract_certificate_text_info(text)
+    try:
+        info = extract_certificate_text_info(text)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e)) from e
     return info.__dict__
 
 
@@ -56,7 +671,10 @@ def ai_generate_tasks(
     weeks = int(payload.get("weeks") or 6)
     hours_per_week = int(payload.get("hours_per_week") or 6)
 
-    plan = generate_task_plan(certification_title=cert.title, weeks=weeks, hours_per_week=hours_per_week)
+    try:
+        plan = generate_task_plan(certification_title=cert.title, weeks=weeks, hours_per_week=hours_per_week)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e)) from e
     created = 0
     now = dt.datetime.now(dt.timezone.utc)
     for t in plan:
@@ -111,7 +729,10 @@ def ai_verify_certificate_upload(
     # Pass the filename as "text" to the AI to simulate OCR extraction 
     # since we don't have a backend image processing pipeline set up.
     mock_text = f"Certificate File: {upload.original_filename}. This certifies that {user.full_name or user.email} has completed the certification."
-    info = extract_certificate_text_info(mock_text)
+    try:
+        info = extract_certificate_text_info(mock_text)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e)) from e
     
     # If the confidence is somehow low or 0, we can boost it for the sake of the mock flow
     # if it found the user's name or something similar.

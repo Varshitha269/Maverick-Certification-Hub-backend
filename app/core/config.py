@@ -35,12 +35,20 @@ class Settings(BaseSettings):
     AZURE_STORAGE_CONNECTION_STRING: str = ""
     AZURE_STORAGE_CONTAINER: str = "certifications"
 
+    # AI provider: azure_openai | ollama
+    AI_ENABLED: bool = False
+    AI_PROVIDER: str = "azure_openai"
+    AI_REQUEST_TIMEOUT_SECONDS: int = 60
+
     # Azure OpenAI
     AZURE_OPENAI_ENDPOINT: str = ""
     AZURE_OPENAI_API_KEY: str = ""
     AZURE_OPENAI_API_VERSION: str = "2024-10-21"
     AZURE_OPENAI_DEPLOYMENT: str = "gpt-4o-mini"
-    AI_ENABLED: bool = False
+
+    # Ollama local runtime
+    OLLAMA_BASE_URL: str = "http://127.0.0.1:11434"
+    OLLAMA_MODEL: str = "llama3.1:8b"
 
     # Scheduler
     REMINDER_JOB_INTERVAL_MINUTES: int = 60
