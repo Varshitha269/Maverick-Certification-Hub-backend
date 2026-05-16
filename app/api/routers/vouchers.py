@@ -9,8 +9,7 @@ from app.models.user import User, UserRole
 from app.models.voucher import Voucher
 from app.models.notification import NotificationType
 from app.services.audit_service import log_audit
-from app.services.email_service import render_simple_email, send_email
-from app.services.notification_service import create_notification
+from app.services.notification_service import create_notification, notify_admins
 
 
 router = APIRouter()
@@ -54,7 +53,6 @@ def admin_issue_voucher(
     db.refresh(row)
 
     title = "Voucher issued"
-    msg = f"A voucher has been issued to you: <b>{row.code}</b>."
     create_notification(
         db,
         user_id=target.id,
@@ -62,9 +60,15 @@ def admin_issue_voucher(
         title=title,
         message=f"Voucher issued: {row.code}",
         link_url=f"{settings.FRONTEND_BASE_URL}/dashboard",
+        email_enabled=True,
     )
-    html = render_simple_email(title, msg, action_url=f"{settings.FRONTEND_BASE_URL}/dashboard", action_text="Open dashboard", preheader="Voucher issued")
-    send_email(db, to_email=target.email, subject=title, html_content=html, user_id=target.id)
+    notify_admins(
+        db,
+        title="Admin issued voucher",
+        message=f"{admin.email} issued a voucher to {target.email}.",
+        link_url="/vouchers",
+        icon="voucher",
+    )
 
     log_audit(
         db,
@@ -95,6 +99,26 @@ def admin_update_voucher(
     db.add(row)
     db.commit()
     db.refresh(row)
+    target = db.query(User).filter(User.id == row.user_id).first()
+    if target:
+        title = "Voucher status updated"
+        msg = f"Your voucher status is now {row.status.value}."
+        create_notification(
+            db,
+            user_id=target.id,
+            type=NotificationType.voucher,
+            title=title,
+            message=msg,
+            link_url="/vouchers",
+            email_enabled=True,
+        )
+    notify_admins(
+        db,
+        title="Admin updated voucher",
+        message=f"{admin.email} updated voucher #{row.id} to {row.status.value}.",
+        link_url="/vouchers",
+        icon="voucher",
+    )
 
     log_audit(
         db,

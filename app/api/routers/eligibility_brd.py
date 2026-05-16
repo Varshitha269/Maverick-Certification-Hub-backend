@@ -10,6 +10,7 @@ from app.api.schemas.eligibility_brd import (
     EligibilityEvaluateRequest,
     EligibilityEvaluationOut,
 )
+from app.core.config import settings
 from app.core.deps import get_current_user, require_role
 from app.db.session import get_db
 from app.models.approval import Approval, ApprovalStatus
@@ -19,6 +20,8 @@ from app.models.registration import Registration, RegistrationStatus
 from app.models.user import User, UserRole
 from app.services.audit_service import log_audit
 from app.services.eligibility import check_eligibility
+from app.services.email_service import render_simple_email, send_email
+from app.services.notification_service import notify_admins
 
 
 router = APIRouter()
@@ -87,6 +90,22 @@ def evaluate_eligibility(
             )
     db.commit()
     db.refresh(ev)
+    subject = f"Eligibility result: {decision.value}"
+    html = render_simple_email(
+        subject,
+        f"Your registration #{reg.id} eligibility status is <b>{decision.value}</b>.",
+        action_url=f"{settings.FRONTEND_BASE_URL}/registrations",
+        action_text="Open registrations",
+        preheader=subject,
+    )
+    send_email(db, to_email=reg.candidate_email, subject=subject, html_content=html)
+    notify_admins(
+        db,
+        title="Admin evaluated eligibility",
+        message=f"{admin.email} evaluated registration #{reg.id}: {decision.value}.",
+        link_url=f"/admin-brd/eligibility?drive_id={drive.id}",
+        icon="eligibility",
+    )
 
     log_audit(
         db,
@@ -121,6 +140,22 @@ def create_approval(
     db.add(row)
     db.commit()
     db.refresh(row)
+    subject = "Approval requested"
+    html = render_simple_email(
+        subject,
+        f"Approval is requested for registration #{reg.id}.",
+        action_url=f"{settings.FRONTEND_BASE_URL}/admin-brd/eligibility",
+        action_text="Open eligibility",
+        preheader=subject,
+    )
+    send_email(db, to_email=row.approver_email, subject=subject, html_content=html)
+    notify_admins(
+        db,
+        title="Admin created approval request",
+        message=f"{admin.email} requested approval for registration #{reg.id} from {row.approver_email}.",
+        link_url=f"/admin-brd/eligibility?drive_id={reg.drive_id}",
+        icon="eligibility",
+    )
     log_audit(
         db,
         actor=admin,
@@ -173,6 +208,23 @@ def decide_approval(
 
     db.commit()
     db.refresh(row)
+    if reg:
+        subject = f"Approval {row.status.value}"
+        html = render_simple_email(
+            subject,
+            f"Your registration #{reg.id} approval was <b>{row.status.value}</b>.<br/>{row.decision_notes or ''}",
+            action_url=f"{settings.FRONTEND_BASE_URL}/registrations",
+            action_text="Open registrations",
+            preheader=subject,
+        )
+        send_email(db, to_email=reg.candidate_email, subject=subject, html_content=html)
+    notify_admins(
+        db,
+        title="Admin decided approval",
+        message=f"{admin.email} marked approval #{row.id} as {row.status.value}.",
+        link_url=f"/admin-brd/eligibility?drive_id={row.drive_id}",
+        icon="eligibility",
+    )
     log_audit(
         db,
         actor=admin,

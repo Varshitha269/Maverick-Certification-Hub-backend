@@ -81,7 +81,7 @@ def main():
         print("\nAdmin user created successfully!")
         print(f"Login with: {default_email}")
         print(f"Password: {default_password}")
-        print(f"URL: http://localhost:3000")
+        print(f"URL: http://localhost:5174")
         print("\nRemember to change the default password in production!")
     else:
         print("\nFailed to create admin user")

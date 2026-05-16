@@ -8,13 +8,39 @@ from app.core.config import settings
 from app.core.deps import get_current_user, require_role
 from app.db.session import get_db
 from app.models.certification import CertificationDrive
+from app.models.certification import Certification
 from app.models.registration import Registration, RegistrationStatus
 from app.models.user import User, UserRole
 from app.services.audit_service import log_audit
 from app.services.email_service import render_simple_email, send_email
+from app.services.notification_service import notify_admins
 
 
 router = APIRouter()
+
+
+def _registration_to_out(db: Session, row: Registration) -> dict:
+    drive = db.query(CertificationDrive).filter(CertificationDrive.id == row.drive_id).first()
+    cert = db.query(Certification).filter(Certification.id == drive.certification_id).first() if drive else None
+    return {
+        "id": row.id,
+        "drive_id": row.drive_id,
+        "drive_name": drive.name if drive else None,
+        "certification_id": cert.id if cert else None,
+        "certification_title": cert.title if cert else None,
+        "certification_provider": cert.provider if cert else None,
+        "emp_id": row.emp_id,
+        "candidate_name": row.candidate_name,
+        "candidate_email": row.candidate_email,
+        "bu": row.bu,
+        "location": row.location,
+        "manager_email": row.manager_email,
+        "exam_track": row.exam_track,
+        "slot": row.slot,
+        "prior_attempts": row.prior_attempts,
+        "status": row.status.value if hasattr(row.status, "value") else str(row.status),
+        "notes": row.notes,
+    }
 
 
 @router.post("/", response_model=RegistrationOut)
@@ -61,6 +87,13 @@ def create_registration(
         preheader="Registration received",
     )
     send_email(db, to_email=row.candidate_email, subject=subject, html_content=html, user_id=user.id)
+    notify_admins(
+        db,
+        title="New drive registration",
+        message=f"{row.candidate_name} ({row.candidate_email}) registered for {drive.name}.",
+        link_url=f"/admin-brd/registrations?drive_id={drive.id}",
+        icon="applications",
+    )
 
     log_audit(
         db,
@@ -84,6 +117,36 @@ def my_registrations(db: Session = Depends(get_db), user: User = Depends(get_cur
     )
 
 
+@router.get("/open-drives")
+def open_drives(db: Session = Depends(get_db), user: User = Depends(get_current_user)):  # noqa: ARG001
+    rows = (
+        db.query(CertificationDrive)
+        .filter(CertificationDrive.status == "open")
+        .order_by(CertificationDrive.start_date.desc(), CertificationDrive.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    result = []
+    for drive in rows:
+        cert = db.query(Certification).filter(Certification.id == drive.certification_id).first()
+        result.append(
+            {
+                "id": drive.id,
+                "name": drive.name,
+                "certification_id": drive.certification_id,
+                "certification_title": cert.title if cert else None,
+                "certification_provider": cert.provider if cert else None,
+                "certification_category": cert.category if cert else None,
+                "start_date": drive.start_date,
+                "end_date": drive.end_date,
+                "voucher_budget": drive.voucher_budget,
+                "target_count": drive.target_count,
+                "sponsor": drive.sponsor,
+            }
+        )
+    return result
+
+
 @router.get("/", response_model=list[RegistrationOut])
 def admin_list_registrations(
     drive_id: int | None = None,
@@ -104,7 +167,8 @@ def admin_list_registrations(
             | (Registration.candidate_name.ilike(like))
             | (Registration.emp_id.ilike(like))
         )
-    return query.order_by(Registration.created_at.desc()).limit(1000).all()
+    rows = query.order_by(Registration.created_at.desc()).limit(1000).all()
+    return [_registration_to_out(db, row) for row in rows]
 
 
 @router.patch("/{registration_id}", response_model=RegistrationOut)
@@ -129,6 +193,26 @@ def admin_update_registration(
     db.add(row)
     db.commit()
     db.refresh(row)
+    subject = f"Registration updated: #{row.id}"
+    body = f"""
+    Your registration status was updated to <b>{row.status.value}</b>.<br/>
+    {row.notes or ""}
+    """.strip()
+    html = render_simple_email(
+        subject,
+        body,
+        action_url=f"{settings.FRONTEND_BASE_URL}/registrations",
+        action_text="Open registrations",
+        preheader=subject,
+    )
+    send_email(db, to_email=row.candidate_email, subject=subject, html_content=html)
+    notify_admins(
+        db,
+        title="Admin updated registration",
+        message=f"{admin.email} updated registration #{row.id} for {row.candidate_email} to {row.status.value}.",
+        link_url=f"/admin-brd/registrations?drive_id={row.drive_id}",
+        icon="applications",
+    )
     log_audit(
         db,
         actor=admin,

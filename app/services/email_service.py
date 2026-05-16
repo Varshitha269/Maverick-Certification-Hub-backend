@@ -28,6 +28,7 @@ class EmailResult:
 
 
 def send_email(db: Session, *, to_email: str, subject: str, html_content: str, user_id: int | None = None) -> EmailResult:
+    to_email = (to_email or "").strip()
     log = EmailLog(
         user_id=user_id,
         to_email=to_email,
@@ -37,6 +38,8 @@ def send_email(db: Session, *, to_email: str, subject: str, html_content: str, u
         success=False,
     )
     try:
+        if not to_email or "@" not in to_email:
+            raise RuntimeError(f"Invalid recipient email: {to_email or '<blank>'}")
         if not settings.ACS_EMAIL_CONNECTION_STRING:
             raise RuntimeError("ACS_EMAIL_CONNECTION_STRING is not configured")
         if not settings.EMAIL_FROM:
@@ -55,7 +58,7 @@ def send_email(db: Session, *, to_email: str, subject: str, html_content: str, u
             },
         }
         poller = client.begin_send(message)
-        result = poller.result(timeout=15.0)
+        result = poller.result(timeout=float(settings.EMAIL_SEND_TIMEOUT_SECONDS))
 
         provider_message_id = None
         status = None

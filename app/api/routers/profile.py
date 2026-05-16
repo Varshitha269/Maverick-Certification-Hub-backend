@@ -6,7 +6,9 @@ from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.user import User
 from app.models.enrollment import Enrollment, EnrollmentStatus
-from app.models.certification import Certification
+from app.models.certification import Certification, CertificationDrive
+from app.models.registration import Registration
+from app.models.assessment import AssessmentResult
 
 router = APIRouter()
 
@@ -63,6 +65,44 @@ def get_profile(db: Session = Depends(get_db), user: User = Depends(get_current_
             "language": "en"
         }
     }
+
+
+@router.get("/drive-history")
+def get_drive_history(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    registrations = (
+        db.query(Registration)
+        .filter(Registration.candidate_email == user.email)
+        .order_by(Registration.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    rows = []
+    for reg in registrations:
+        drive = db.query(CertificationDrive).filter(CertificationDrive.id == reg.drive_id).first()
+        cert = db.query(Certification).filter(Certification.id == drive.certification_id).first() if drive else None
+        result = (
+            db.query(AssessmentResult)
+            .filter(AssessmentResult.registration_id == reg.id)
+            .order_by(AssessmentResult.created_at.desc())
+            .first()
+        )
+        rows.append(
+            {
+                "registration_id": reg.id,
+                "drive_id": reg.drive_id,
+                "drive_name": drive.name if drive else f"Drive #{reg.drive_id}",
+                "drive_status": drive.status if drive else None,
+                "certification_title": cert.title if cert else reg.exam_track,
+                "provider": cert.provider if cert else None,
+                "candidate_name": reg.candidate_name,
+                "application_status": reg.status.value if hasattr(reg.status, "value") else str(reg.status),
+                "outcome": result.outcome.value if result and hasattr(result.outcome, "value") else (str(result.outcome) if result else None),
+                "score": result.score if result else None,
+                "assessed_on": result.assessed_on if result else None,
+                "updated_at": reg.updated_at,
+            }
+        )
+    return {"items": rows}
 
 
 @router.patch("/me")

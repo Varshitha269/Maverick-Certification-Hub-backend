@@ -5,14 +5,12 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, require_role
-from app.core.config import settings
 from app.db.session import get_db
+from app.models.certification import CertificationDrive
 from app.models.notification import Notification, NotificationType
 from app.models.user import User, UserRole
 from app.services.audit_service import log_audit
-from app.services.email_service import render_simple_email, send_email
-from app.services.message_formatting import message_to_html
-from app.services.notification_service import create_notification, mark_read
+from app.services.notification_service import create_notification, deliver_due_notification_emails, mark_read
 
 
 router = APIRouter()
@@ -26,19 +24,19 @@ def my_notifications(db: Session = Depends(get_db), user: User = Depends(get_cur
         .filter(
             Notification.user_id == user.id,
             (Notification.scheduled_at.is_(None)) | (Notification.scheduled_at <= now),
-            (Notification.expires_at.is_(None)) | (Notification.expires_at > now),
         )
         .order_by(Notification.created_at.desc())
         .limit(200)
         .all()
     )
+    link_urls = _resolved_link_urls(db, rows, user)
     return [
         {
             "id": n.id,
             "type": n.type,
             "title": n.title,
             "message": n.message,
-            "link_url": n.link_url,
+            "link_url": link_urls.get(n.id) or n.link_url,
             "priority": n.priority,
             "image_url": n.image_url,
             "icon": n.icon,
@@ -54,6 +52,29 @@ def my_notifications(db: Session = Depends(get_db), user: User = Depends(get_cur
         }
         for n in rows
     ]
+
+
+def _resolved_link_urls(db: Session, notifications: list[Notification], user: User) -> dict[int, str]:
+    drive_notifications = [
+        row
+        for row in notifications
+        if "drive_id=" not in (row.link_url or "") and "drive" in f"{row.title} {row.message}".lower()
+    ]
+    if not drive_notifications:
+        return {}
+
+    drives = db.query(CertificationDrive.id, CertificationDrive.name).order_by(CertificationDrive.id.desc()).all()
+    links: dict[int, str] = {}
+    for notification in drive_notifications:
+        message = notification.message or ""
+        match = next((drive for drive in drives if drive.name and drive.name in message), None)
+        if not match:
+            continue
+        if user.role == UserRole.admin:
+            links[notification.id] = f"/admin-brd/drives?drive_id={match.id}"
+        else:
+            links[notification.id] = f"/registrations?drive_id={match.id}"
+    return links
 
 
 @router.post("/me/{notification_id}/read")
@@ -129,27 +150,16 @@ def admin_broadcast(
             email_enabled=email_enabled,
             audience=audience,
             content_format=content_format,
+            deliver_email_now=False,
         ))
 
     emails_attempted = 0
     emails_sent = 0
     now = dt.datetime.now(dt.timezone.utc)
     if email_enabled and (scheduled_at is None or scheduled_at <= now):
-        html = render_simple_email(
-            title,
-            message_to_html(message, content_format),
-            action_url=_absolute_frontend_url(link_url),
-            action_text="Open",
-            preheader=f"{priority.title()} priority broadcast",
-        )
-        for u, notification in zip(users, created_notifications):
-            result = send_email(db, to_email=u.email, subject=title, html_content=html, user_id=u.id)
-            if result.success:
-                notification.email_sent_at = now
-                db.add(notification)
-                emails_sent += 1
-            emails_attempted += 1
-        db.commit()
+        delivery = deliver_due_notification_emails(db)
+        emails_attempted = delivery["checked"]
+        emails_sent = delivery["sent"]
 
     log_audit(
         db,
@@ -215,13 +225,4 @@ def _with_active_admins(db: Session, users: list[User]):
         rows[admin.id] = admin
     return list(rows.values())
 
-
-def _absolute_frontend_url(link_url: str | None) -> str | None:
-    if not link_url:
-        return None
-    if link_url.startswith("http://") or link_url.startswith("https://"):
-        return link_url
-    base = settings.FRONTEND_BASE_URL.rstrip("/")
-    path = link_url if link_url.startswith("/") else f"/{link_url}"
-    return f"{base}{path}"
 

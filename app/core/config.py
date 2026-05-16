@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Maverick Certification Hub"
     ENVIRONMENT: str = "dev"
     API_BASE_URL: str = "http://127.0.0.1:8080"
-    FRONTEND_BASE_URL: str = "http://127.0.0.1:3000"
+    FRONTEND_BASE_URL: str = "http://127.0.0.1:5174"
 
     # Security
     # I run the cmd in terminal for jwt - python -c "import secrets; print(secrets.token_hex(32))"
@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     ACS_EMAIL_CONNECTION_STRING: str = ""
     # Verified MailFrom address for ACS Email (linked domain or *.azurecomm.net sandbox)
     EMAIL_FROM: str = ""
+    EMAIL_SEND_TIMEOUT_SECONDS: int = 90
+    EMAIL_DELIVERY_BATCH_SIZE: int = 25
+    EMAIL_RETRY_AFTER_SECONDS: int = 300
 
     # Azure Blob Storage
     AZURE_STORAGE_CONNECTION_STRING: str = ""

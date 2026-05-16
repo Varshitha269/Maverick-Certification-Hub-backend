@@ -15,6 +15,11 @@ class DriveBRDUpdate(BaseModel):
     repository_prefix: str | None = Field(default=None, max_length=300)
 
 
+class DriveBRDCreate(DriveBRDUpdate):
+    certification_id: int
+    name: str = Field(max_length=200)
+
+
 class DriveBRDOut(BaseModel):
     id: int
     certification_id: int
@@ -41,6 +46,7 @@ class DriveBRDOut(BaseModel):
     can_conduct: bool = True
     can_reconduct: bool = False
     next_action: str | None = None
+    recent_attendees: list[dict] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 

@@ -13,8 +13,7 @@ from app.models.eligibility import EligibilityTestAttempt
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.user import User, UserRole
 from app.models.task import Task, TaskStatus
-from app.services.email_service import render_simple_email, send_email
-from app.services.notification_service import create_notification
+from app.services.notification_service import create_notification, notify_admins
 from app.models.notification import NotificationType
 
 
@@ -120,6 +119,14 @@ def select_certification(payload: EnrollmentCreate, db: Session = Depends(get_db
                 title="Application Approved",
                 message=f"You have officially enrolled in {cert.title} ({cert.provider}).",
                 link_url=f"{settings.FRONTEND_BASE_URL}/learning/{existing.id}",
+                email_enabled=True,
+            )
+            notify_admins(
+                db,
+                title="User enrolled in certification",
+                message=f"{user.email} enrolled in {cert.title} ({cert.provider}).",
+                link_url="/admin",
+                icon="certificate",
             )
             return existing
         raise HTTPException(status_code=400, detail="Already enrolled in this certification")
@@ -155,22 +162,16 @@ def select_certification(payload: EnrollmentCreate, db: Session = Depends(get_db
         title=subject,
         message=message_text,
         link_url=f"{settings.FRONTEND_BASE_URL}/dashboard",
+        email_enabled=True,
     )
-    
-    # Send email only for actual enrollment
     if not is_saved:
-        body = f"""
-        You selected <b>{cert.title}</b> ({cert.provider}).<br/>
-        Track your tasks and progress in your dashboard.
-        """.strip()
-        html = render_simple_email(
-            subject,
-            body,
-            action_url=f"{settings.FRONTEND_BASE_URL}/dashboard",
-            action_text="Open dashboard",
-            preheader=f"Selected: {cert.title}",
+        notify_admins(
+            db,
+            title="User enrolled in certification",
+            message=f"{user.email} enrolled in {cert.title} ({cert.provider}).",
+            link_url="/admin",
+            icon="certificate",
         )
-        send_email(db, to_email=user.email, subject=subject, html_content=html, user_id=user.id)
 
     return enrollment
 

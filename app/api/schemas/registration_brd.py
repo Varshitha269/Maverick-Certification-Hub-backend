@@ -23,6 +23,10 @@ class RegistrationUpdate(BaseModel):
 class RegistrationOut(BaseModel):
     id: int
     drive_id: int
+    drive_name: str | None = None
+    certification_id: int | None = None
+    certification_title: str | None = None
+    certification_provider: str | None = None
     emp_id: str | None
     candidate_name: str
     candidate_email: EmailStr

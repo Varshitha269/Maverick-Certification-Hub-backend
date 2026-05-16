@@ -1,7 +1,7 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -11,13 +11,14 @@ from app.core.security import hash_password
 from app.db.session import get_db
 from app.models.certification import Certification
 from app.models.certification import CertificationDrive
+from app.models.assessment import AssessmentOutcome, AssessmentResult
 from app.models.audit import AuditLog
 from app.models.email_log import EmailLog
 from app.models.eligibility import EligibilityTestAttempt
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.registration import Registration
 from app.models.task import Task, TaskStatus
-from app.models.upload import UploadedFile, UploadPurpose
+from app.models.upload import UploadedFile
 from app.models.user import User, UserRole
 from app.models.voucher import Voucher, VoucherStatus
 from app.services.audit_service import log_audit
@@ -145,7 +146,12 @@ def brd_overview(db: Session = Depends(get_db)):
         .scalar()
         or 0
     )
-    pending_documents = db.query(func.count(UploadedFile.id)).filter(UploadedFile.purpose != UploadPurpose.certificate).scalar() or 0
+    pending_documents = (
+        db.query(func.count(UploadedFile.id))
+        .filter(UploadedFile.review_status == "under_review")
+        .scalar()
+        or 0
+    )
     issued_vouchers = db.query(func.count(Voucher.id)).filter(Voucher.status == VoucherStatus.issued).scalar() or 0
     used_vouchers = db.query(func.count(Voucher.id)).filter(Voucher.status == VoucherStatus.redeemed).scalar() or 0
     completed = db.query(func.count(Enrollment.id)).filter(Enrollment.status == EnrollmentStatus.completed).scalar() or 0
@@ -155,6 +161,19 @@ def brd_overview(db: Session = Depends(get_db)):
     review_attempts = db.query(func.count(EligibilityTestAttempt.id)).filter(EligibilityTestAttempt.passed == False).scalar() or 0  # noqa: E712
     eligible_users = db.query(func.count(func.distinct(EligibilityTestAttempt.user_id))).filter(EligibilityTestAttempt.passed == True).scalar() or 0  # noqa: E712
     avg_test_score = db.query(func.avg(EligibilityTestAttempt.score)).scalar()
+    total_drives = db.query(func.count(CertificationDrive.id)).scalar() or 0
+    open_drives = db.query(func.count(CertificationDrive.id)).filter(CertificationDrive.status == "open").scalar() or 0
+    planned_drives = db.query(func.count(CertificationDrive.id)).filter(CertificationDrive.status == "planned").scalar() or 0
+    completed_drives = (
+        db.query(func.count(CertificationDrive.id))
+        .filter(CertificationDrive.status.in_(["completed", "closed"]))
+        .scalar()
+        or 0
+    )
+    drive_registrations = db.query(func.count(Registration.id)).scalar() or 0
+    drive_assessments = db.query(func.count(AssessmentResult.id)).scalar() or 0
+    drive_passes = db.query(func.count(AssessmentResult.id)).filter(AssessmentResult.outcome == AssessmentOutcome.pass_).scalar() or 0
+    drive_fails = db.query(func.count(AssessmentResult.id)).filter(AssessmentResult.outcome == AssessmentOutcome.fail).scalar() or 0
 
     review_rows = (
         db.query(Enrollment)
@@ -194,6 +213,16 @@ def brd_overview(db: Session = Depends(get_db)):
         or 0
     )
     voucher_rows = db.query(Voucher.status, func.count(Voucher.id)).group_by(Voucher.status).all()
+    drive_status_rows = db.query(CertificationDrive.status, func.count(CertificationDrive.id)).group_by(CertificationDrive.status).all()
+    drive_result_rows = db.query(AssessmentResult.outcome, func.count(AssessmentResult.id)).group_by(AssessmentResult.outcome).all()
+    drive_activity_rows = (
+        db.query(CertificationDrive.name, func.count(Registration.id).label("registrations"))
+        .outerjoin(Registration, Registration.drive_id == CertificationDrive.id)
+        .group_by(CertificationDrive.id, CertificationDrive.name)
+        .order_by(func.count(Registration.id).desc())
+        .limit(8)
+        .all()
+    )
     audit_rows = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(8).all()
     test_rows = (
         db.query(EligibilityTestAttempt)
@@ -235,10 +264,22 @@ def brd_overview(db: Session = Depends(get_db)):
             "eligible_users": eligible_users,
             "eligibility_review_required": review_attempts,
             "avg_test_score": round(float(avg_test_score), 1) if avg_test_score is not None else 0,
+            "total_drives": total_drives,
+            "open_drives": open_drives,
+            "planned_drives": planned_drives,
+            "completed_drives": completed_drives,
+            "drive_active_rate": round((open_drives / total_drives) * 100) if total_drives else 0,
+            "drive_completion_rate": round((completed_drives / total_drives) * 100) if total_drives else 0,
+            "drive_registrations": drive_registrations,
+            "drive_assessments": drive_assessments,
+            "drive_pass_rate": round((drive_passes / drive_assessments) * 100) if drive_assessments else 0,
         },
         "charts": {
             "users_per_certification": [{"name": title, "users": users} for title, users in users_per_cert_rows],
             "voucher_status": [{"name": status.value if hasattr(status, "value") else str(status), "value": count} for status, count in voucher_rows],
+            "drive_status": [{"name": status or "unknown", "value": count} for status, count in drive_status_rows],
+            "drive_results": [{"name": outcome.value if hasattr(outcome, "value") else str(outcome), "value": count} for outcome, count in drive_result_rows],
+            "drive_activity": [{"name": name, "registrations": registrations} for name, registrations in drive_activity_rows],
             "eligibility_tests": [
                 {"name": "Eligible", "value": eligible_attempts},
                 {"name": "Review", "value": review_attempts},
@@ -414,8 +455,22 @@ def activity_heatmap(db: Session = Depends(get_db)):
 
 
 @router.post("/reminders/run")
-def run_reminders(request: Request, db: Session = Depends(get_db), admin: User = Depends(require_role(UserRole.admin))):
-    result = send_pending_and_overdue_reminders(db)
+def run_reminders(
+    payload: dict | None = Body(default=None),
+    request: Request = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_role(UserRole.admin)),
+):
+    payload = payload or {}
+    user_id = payload.get("user_id")
+    result = send_pending_and_overdue_reminders(
+        db,
+        user_scope=(payload.get("user_scope") or "active"),
+        user_id=int(user_id) if user_id not in {None, ""} else None,
+        enrollment_status=(payload.get("enrollment_status") or "pending"),
+        include_broadcast_expiry=bool(payload.get("include_broadcast_expiry", False)),
+        broadcast_expiry_days=int(payload.get("broadcast_expiry_days") or 7),
+    )
     log_audit(db, actor=admin, action="reminders.run", entity="reminder_job", entity_id="default", request=request, details=result)
     return result
 

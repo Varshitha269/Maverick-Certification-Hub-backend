@@ -6,12 +6,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.schemas.assessment_brd import AssessmentCreate, AssessmentOut
+from app.core.config import settings
 from app.core.deps import require_role
 from app.db.session import get_db
 from app.models.assessment import AssessmentOutcome, AssessmentResult
 from app.models.registration import Registration, RegistrationStatus
 from app.models.user import User, UserRole
 from app.services.audit_service import log_audit
+from app.services.email_service import render_simple_email, send_email
+from app.services.notification_service import notify_admins
 
 
 router = APIRouter()
@@ -55,6 +58,26 @@ def create_result(
 
     db.commit()
     db.refresh(row)
+    subject = f"Assessment result: {outcome.value}"
+    body = f"""
+    Your assessment result for registration #{reg.id} is <b>{outcome.value}</b>.<br/>
+    {f"Score: {row.score}" if row.score is not None else ""}
+    """.strip()
+    html = render_simple_email(
+        subject,
+        body,
+        action_url=f"{settings.FRONTEND_BASE_URL}/registrations",
+        action_text="Open registrations",
+        preheader=subject,
+    )
+    send_email(db, to_email=reg.candidate_email, subject=subject, html_content=html)
+    notify_admins(
+        db,
+        title="Admin added assessment result",
+        message=f"{admin.email} recorded {outcome.value} for registration #{reg.id} ({reg.candidate_email}).",
+        link_url=f"/admin-brd/results?drive_id={reg.drive_id}",
+        icon="results",
+    )
     log_audit(
         db,
         actor=admin,

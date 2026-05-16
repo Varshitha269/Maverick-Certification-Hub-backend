@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import re
+from difflib import SequenceMatcher
 
 from fastapi import APIRouter, Depends, HTTPException
 from openai import AzureOpenAI
@@ -22,9 +23,163 @@ from app.models.user import UserRole
 from app.models.upload import UploadedFile
 from app.models.voucher import Voucher
 from app.services.ai_service import extract_certificate_text_info, generate_task_plan
+from app.services.storage_service import stream_blob
 
 
 router = APIRouter()
+
+
+TOKEN_STOPWORDS = {
+    "and",
+    "the",
+    "for",
+    "with",
+    "certificate",
+    "certification",
+    "certified",
+    "course",
+    "exam",
+    "proof",
+    "completed",
+    "completion",
+    "professional",
+    "associate",
+    "foundation",
+    "foundational",
+    "fundamentals",
+}
+
+PROVIDER_ALIASES = {
+    "aws": {"aws", "amazon", "amazonwebservices"},
+    "amazon web services": {"aws", "amazon", "amazonwebservices"},
+    "microsoft": {"microsoft", "azure"},
+    "azure": {"microsoft", "azure"},
+    "servicenow": {"servicenow", "service-now"},
+    "google": {"google", "gcp", "googlecloud"},
+    "google cloud": {"google", "gcp", "googlecloud"},
+}
+
+
+def _tokenize(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    compact = value.lower().replace("&", " and ")
+    compact = re.sub(r"[_/().-]+", " ", compact)
+    tokens = {
+        token.strip("._-/()[]{}:,;")
+        for token in re.findall(r"[a-zA-Z0-9+#]+", compact)
+    }
+    normalized = {token for token in tokens if token}
+    return {token for token in normalized if len(token) >= 2 and token not in TOKEN_STOPWORDS}
+
+
+def _provider_terms(value: str | None) -> set[str]:
+    tokens = _tokenize(value)
+    terms = set(tokens)
+    raw = (value or "").strip().lower()
+    for key, aliases in PROVIDER_ALIASES.items():
+        if key in raw or tokens.intersection(aliases):
+            terms.update(aliases)
+    return terms
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text_from_upload(upload: UploadedFile, *, max_bytes: int = 256_000) -> str:
+    """
+    Best-effort text source for verification. Real OCR/PDF parsing can be
+    plugged in later; this still prevents a fixed pass score for unrelated
+    uploads by validating filename and any extractable plain text bytes.
+    """
+    parts = [upload.original_filename or ""]
+    try:
+        data = bytearray()
+        for chunk in stream_blob(upload.blob_path):
+            data.extend(chunk)
+            if len(data) >= max_bytes:
+                break
+        raw = bytes(data[:max_bytes])
+        decoded = raw.decode("utf-8", errors="ignore")
+        if len(decoded.strip()) < 20:
+            decoded = raw.decode("latin-1", errors="ignore")
+        cleaned = re.sub(r"[^\w\s+.#/-]", " ", decoded)
+        parts.append(cleaned[:20_000])
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(part for part in parts if part)
+
+
+def _verification_score(*, cert: Certification, info: dict, evidence_text: str) -> dict:
+    expected_title = cert.title or ""
+    expected_provider = cert.provider or ""
+    extracted_title = info.get("certification_title") or ""
+    extracted_provider = info.get("provider") or ""
+
+    expected_title_tokens = _tokenize(expected_title)
+    evidence_tokens = _tokenize(f"{evidence_text} {extracted_title}")
+    expected_provider_terms = _provider_terms(expected_provider)
+    evidence_provider_terms = _provider_terms(f"{evidence_text} {extracted_provider}")
+
+    title_overlap = (
+        len(expected_title_tokens.intersection(evidence_tokens)) / max(1, len(expected_title_tokens))
+        if expected_title_tokens
+        else 0.0
+    )
+    expected_codes = {token for token in expected_title_tokens if any(char.isdigit() for char in token)}
+    code_match = bool(expected_codes.intersection(evidence_tokens))
+    if code_match:
+        title_overlap = max(title_overlap, 0.6)
+    provider_overlap = 1.0 if expected_provider_terms.intersection(evidence_provider_terms) else 0.0
+    string_similarity = SequenceMatcher(
+        None,
+        re.sub(r"\s+", " ", expected_title.lower()).strip(),
+        re.sub(r"\s+", " ", extracted_title.lower()).strip(),
+    ).ratio() if extracted_title else 0.0
+    ai_confidence = max(0.0, min(1.0, _safe_float(info.get("confidence"))))
+
+    confidence = round(
+        min(
+            0.99,
+            (title_overlap * 0.55)
+            + (provider_overlap * 0.25)
+            + (string_similarity * 0.15)
+            + (ai_confidence * 0.05)
+            + (0.35 if code_match and title_overlap >= 0.6 else 0.0),
+        ),
+        2,
+    )
+    matched = confidence >= 0.70 and title_overlap >= 0.45
+
+    if matched:
+        reason = "The uploaded certificate appears to match the enrollment certification."
+    elif not evidence_text.strip():
+        reason = "The upload could not be read well enough to verify it."
+    elif title_overlap < 0.25 and provider_overlap == 0:
+        reason = "The upload does not mention the expected certification or provider."
+    elif title_overlap < 0.45:
+        reason = "The provider may match, but the certification title does not match strongly enough."
+    else:
+        reason = "The certificate details are close, but below the approval threshold."
+
+    return {
+        "confidence": confidence,
+        "matched": matched,
+        "status": "matched" if matched else "mismatch",
+        "reason": reason,
+        "expected_certification": expected_title,
+        "expected_provider": expected_provider,
+        "match_details": {
+            "title_overlap": round(title_overlap, 2),
+            "provider_match": bool(provider_overlap),
+            "code_match": code_match,
+            "title_similarity": round(string_similarity, 2),
+        },
+    }
 
 
 def _cert_summary(cert: Certification) -> str:
@@ -715,30 +870,40 @@ def ai_verify_certificate_upload(
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
 
-    if not settings.AI_ENABLED:
-        # Mock successful verification when AI is disabled
-        return {
-            "candidate_name": user.full_name or user.email,
-            "certification_title": "Mock Certification",
-            "provider": "Mock Provider",
-            "issued_on": dt.datetime.now().isoformat(),
-            "credential_id": f"MOCK-{upload_id}",
-            "confidence": 0.95
-        }
+    if not upload.enrollment_id:
+        raise HTTPException(status_code=400, detail="Link the certificate upload to an enrollment before verification")
 
-    # Pass the filename as "text" to the AI to simulate OCR extraction 
-    # since we don't have a backend image processing pipeline set up.
-    mock_text = f"Certificate File: {upload.original_filename}. This certifies that {user.full_name or user.email} has completed the certification."
-    try:
-        info = extract_certificate_text_info(mock_text)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    
-    # If the confidence is somehow low or 0, we can boost it for the sake of the mock flow
-    # if it found the user's name or something similar.
-    result = info.__dict__
-    if result.get("confidence", 0) < 0.8:
-        result["confidence"] = 0.90  # Mock boost
+    enrollment = (
+        db.query(Enrollment)
+        .filter(Enrollment.id == upload.enrollment_id, Enrollment.user_id == user.id)
+        .first()
+    )
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Enrollment not found for this upload")
 
-    return result
+    cert = db.query(Certification).filter(Certification.id == enrollment.certification_id).first()
+    if not cert:
+        raise HTTPException(status_code=404, detail="Certification not found for this enrollment")
+
+    evidence_text = _text_from_upload(upload)
+    info = {
+        "candidate_name": user.full_name or user.email,
+        "certification_title": None,
+        "provider": None,
+        "issued_on": None,
+        "credential_id": None,
+        "confidence": 0.0,
+    }
+
+    if settings.AI_ENABLED:
+        try:
+            extracted = extract_certificate_text_info(evidence_text)
+            info.update(extracted.__dict__)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=str(e)) from e
+    else:
+        info["certification_title"] = upload.original_filename
+
+    verification = _verification_score(cert=cert, info=info, evidence_text=evidence_text)
+    return {**info, **verification}
 

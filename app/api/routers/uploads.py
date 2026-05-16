@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.core.deps import get_current_user, require_role
 from app.db.session import get_db
@@ -10,7 +10,7 @@ from app.models.enrollment import Enrollment
 from app.models.certification import Certification
 from app.models.notification import NotificationType
 from app.services.storage_service import upload_bytes
-from app.services.notification_service import create_notification
+from app.services.notification_service import create_notification, notify_admins
 
 
 router = APIRouter()
@@ -25,6 +25,7 @@ def my_uploads(db: Session = Depends(get_db), user: User = Depends(get_current_u
     for r in rows:
         upload_data = {
             "id": r.id,
+            "enrollment_id": r.enrollment_id,
             "purpose": r.purpose,
             "original_filename": r.original_filename,
             "content_type": r.content_type,
@@ -32,6 +33,11 @@ def my_uploads(db: Session = Depends(get_db), user: User = Depends(get_current_u
             "size_bytes": r.size_bytes,
             "sha256": r.sha256,
             "created_at": r.created_at,
+            "status": r.review_status,
+            "review_status": r.review_status,
+            "review_reason": r.review_reason,
+            "reviewed_by": r.reviewed_by,
+            "reviewed_at": r.reviewed_at,
             "download_url": f"/api/v1/uploads/{r.id}/download",
         }
         
@@ -174,7 +180,11 @@ def admin_uploads(db: Session = Depends(get_db), admin: User = Depends(require_r
             "blob_path": r.blob_path,
             "size_bytes": r.size_bytes,
             "created_at": r.created_at,
-            "status": "under_review",
+            "status": r.review_status,
+            "review_status": r.review_status,
+            "review_reason": r.review_reason,
+            "reviewed_by": r.reviewed_by,
+            "reviewed_at": r.reviewed_at,
             "download_url": f"/api/v1/uploads/{r.id}/download",
         }
         for r in rows
@@ -196,6 +206,13 @@ def review_upload(
     if decision not in {"approved", "rejected"}:
         raise HTTPException(status_code=400, detail="decision must be approved or rejected")
 
+    row.review_status = decision
+    row.review_reason = reason or None
+    row.reviewed_by = admin.email
+    row.reviewed_at = datetime.now(timezone.utc)
+    db.add(row)
+    db.commit()
+
     title = "Document approved" if decision == "approved" else "Document rejected"
     message = f"{row.original_filename} was {decision}."
     if reason:
@@ -207,6 +224,14 @@ def review_upload(
         title=title,
         message=message,
         link_url="/uploads",
+        email_enabled=True,
+    )
+    notify_admins(
+        db,
+        title=f"Admin reviewed document: {decision}",
+        message=f"{admin.email} marked {row.original_filename} as {decision}.",
+        link_url="/uploads",
+        icon="uploads",
     )
     return {"ok": True, "upload_id": row.id, "decision": decision, "reviewed_by": admin.email}
 
