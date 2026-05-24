@@ -9,7 +9,14 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.api.routers.enrollments import _ensure_default_tasks
-from app.api.routers.ai_insights import admin_voucher_recommendations
+from app.api.routers.ai_insights import (
+    admin_fraud_duplicate_detection,
+    admin_natural_language_query,
+    admin_pass_rate_predictor,
+    admin_reconduct_recommendations,
+    admin_voucher_budget_optimizer,
+    admin_voucher_recommendations,
+)
 from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.session import get_db
@@ -257,6 +264,11 @@ def _available_tools(user: User) -> list[dict]:
                 {"name": "admin_list_registrations", "role": "admin", "examples": ["list registrations", "pending registrations"]},
                 {"name": "admin_list_vouchers", "role": "admin", "examples": ["list vouchers"]},
                 {"name": "admin_voucher_recommendations", "role": "admin", "examples": ["smart voucher distribution", "recommend voucher allocation"]},
+                {"name": "admin_natural_language_query", "role": "admin", "examples": ["show passed users without voucher", "detect duplicate registrations"]},
+                {"name": "admin_voucher_budget_optimizer", "role": "admin", "examples": ["optimize voucher budget", "allocate 10 vouchers"]},
+                {"name": "admin_reconduct_recommendations", "role": "admin", "examples": ["which drives should be reconducted"]},
+                {"name": "admin_pass_rate_predictor", "role": "admin", "examples": ["predict pass rate"]},
+                {"name": "admin_fraud_duplicate_detection", "role": "admin", "examples": ["find duplicate or suspicious candidates"]},
             ]
         )
     return tools
@@ -437,6 +449,64 @@ def _tool_schemas(user: User) -> list[dict]:
                                 "drive_id": {"type": "integer", "description": "Optional drive id. Omit to scan all drives."},
                             },
                         },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_natural_language_query",
+                        "description": "Answer natural-language admin data questions such as passed users without voucher, duplicate registrations, pass-rate risk, or re-conduct candidates.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "The admin's natural-language query."},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_voucher_budget_optimizer",
+                        "description": "Optimize voucher allocation under a limited voucher budget.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "drive_id": {"type": "integer"},
+                                "budget": {"type": "integer", "minimum": 0},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_reconduct_recommendations",
+                        "description": "Recommend completed or closed drives that should be re-conducted based on demand, failures, no-shows, and pass rate.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_pass_rate_predictor",
+                        "description": "Predict pass-rate risk for one drive or all drives using readiness and historical outcomes.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "drive_id": {"type": "integer"},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_fraud_duplicate_detection",
+                        "description": "Find duplicate registrations, repeated attempts, duplicate vouchers, and suspicious certificate uploads.",
+                        "parameters": {"type": "object", "properties": {}},
                     },
                 },
             ]
@@ -682,6 +752,29 @@ def _execute_chat_tool(name: str, args: dict, db: Session, user: User) -> dict:
         drive_id = int(args["drive_id"]) if args.get("drive_id") is not None else None
         result = admin_voucher_recommendations(drive_id=drive_id, db=db, admin=user)
         return _response("admin_voucher_recommendations", result.get("message") or "Voucher recommendations loaded.", result)
+
+    if name == "admin_natural_language_query":
+        result = admin_natural_language_query({"query": args.get("query"), "limit": args.get("limit")}, db=db, admin=user)
+        return _response("admin_natural_language_query", result.get("explanation") or "Query completed.", result)
+
+    if name == "admin_voucher_budget_optimizer":
+        drive_id = int(args["drive_id"]) if args.get("drive_id") is not None else None
+        budget = int(args["budget"]) if args.get("budget") is not None else None
+        result = admin_voucher_budget_optimizer(drive_id=drive_id, budget=budget, db=db, admin=user)
+        return _response("admin_voucher_budget_optimizer", result.get("summary") or "Voucher budget optimized.", result)
+
+    if name == "admin_reconduct_recommendations":
+        result = admin_reconduct_recommendations(db=db, admin=user)
+        return _response("admin_reconduct_recommendations", f"Found {len(result['recommendations'])} re-conduct recommendation(s).", result)
+
+    if name == "admin_pass_rate_predictor":
+        drive_id = int(args["drive_id"]) if args.get("drive_id") is not None else None
+        result = admin_pass_rate_predictor(drive_id=drive_id, db=db, admin=user)
+        return _response("admin_pass_rate_predictor", f"Predicted pass rate for {len(result['predictions'])} drive(s).", result)
+
+    if name == "admin_fraud_duplicate_detection":
+        result = admin_fraud_duplicate_detection(db=db, admin=user)
+        return _response("admin_fraud_duplicate_detection", result.get("summary") or "Fraud scan completed.", result)
 
     raise HTTPException(status_code=400, detail=f"Unknown tool: {name}")
 
