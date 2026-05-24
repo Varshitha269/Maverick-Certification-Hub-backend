@@ -41,6 +41,7 @@ class DriveBRDOut(BaseModel):
     assessed_count: int = 0
     passed_count: int = 0
     failed_count: int = 0
+    voucher_ready_count: int = 0
     voucher_count: int = 0
     last_conducted_date: str | None = None
     can_conduct: bool = True

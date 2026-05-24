@@ -9,6 +9,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.api.routers.enrollments import _ensure_default_tasks
+from app.api.routers.ai_insights import admin_voucher_recommendations
 from app.core.config import settings
 from app.core.deps import get_current_user
 from app.db.session import get_db
@@ -255,6 +256,7 @@ def _available_tools(user: User) -> list[dict]:
                 {"name": "admin_list_enrollments", "role": "admin", "examples": ["list all enrollments"]},
                 {"name": "admin_list_registrations", "role": "admin", "examples": ["list registrations", "pending registrations"]},
                 {"name": "admin_list_vouchers", "role": "admin", "examples": ["list vouchers"]},
+                {"name": "admin_voucher_recommendations", "role": "admin", "examples": ["smart voucher distribution", "recommend voucher allocation"]},
             ]
         )
     return tools
@@ -420,6 +422,19 @@ def _tool_schemas(user: User) -> list[dict]:
                             "properties": {
                                 "user_id": {"type": "integer"},
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 25},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "admin_voucher_recommendations",
+                        "description": "Recommend smart voucher allocation from eligible, scheduled, assessed, or passed registrations. Use this for smart voucher distribution or allocation recommendations, not admin_list_vouchers.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "drive_id": {"type": "integer", "description": "Optional drive id. Omit to scan all drives."},
                             },
                         },
                     },
@@ -662,6 +677,11 @@ def _execute_chat_tool(name: str, args: dict, db: Session, user: User) -> dict:
             for row in rows
         ]
         return _response("admin_list_vouchers", f"Found {len(data)} voucher(s).", data)
+
+    if name == "admin_voucher_recommendations":
+        drive_id = int(args["drive_id"]) if args.get("drive_id") is not None else None
+        result = admin_voucher_recommendations(drive_id=drive_id, db=db, admin=user)
+        return _response("admin_voucher_recommendations", result.get("message") or "Voucher recommendations loaded.", result)
 
     raise HTTPException(status_code=400, detail=f"Unknown tool: {name}")
 

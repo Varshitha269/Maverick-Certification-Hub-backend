@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.routers import admin, ai, auth, certifications, dashboard, enrollments, exports, notifications, tasks, uploads, users, vouchers, profile, ai_suggestions, notifications_extended
+from app.api.routers import admin, ai, ai_insights, auth, certifications, dashboard, enrollments, exports, notifications, tasks, uploads, users, vouchers, profile, ai_suggestions, notifications_extended
 from app.api.routers import drives_brd, registrations_brd, eligibility_brd, results_brd, ai_brd
 
 
@@ -15,6 +15,7 @@ api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboar
 api_router.include_router(notifications.router, prefix="/notifications", tags=["notifications"])
 api_router.include_router(vouchers.router, prefix="/vouchers", tags=["vouchers"])
 api_router.include_router(ai.router, prefix="/ai", tags=["ai"])
+api_router.include_router(ai_insights.router, prefix="/ai", tags=["ai-insights"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 api_router.include_router(exports.router, prefix="/admin/exports", tags=["admin-exports"])
 # New routers

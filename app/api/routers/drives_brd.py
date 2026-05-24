@@ -464,6 +464,17 @@ def _drive_to_out(db: Session, drive: CertificationDrive) -> dict:
         or 0
     )
     voucher_count = db.query(func.count(Voucher.id)).filter(Voucher.drive_id == drive.id).scalar() or 0
+    voucher_ready_count = (
+        db.query(func.count(Registration.id))
+        .filter(Registration.drive_id == drive.id, Registration.status.in_([
+            RegistrationStatus.eligible,
+            RegistrationStatus.scheduled,
+            RegistrationStatus.assessed,
+            RegistrationStatus.passed,
+        ]))
+        .scalar()
+        or 0
+    )
     last_assessed = db.query(func.max(AssessmentResult.assessed_on)).filter(AssessmentResult.drive_id == drive.id).scalar()
     last_conducted_date = last_assessed or (drive.end_date if drive.status in {"closed", "completed"} else None)
     can_reconduct = bool(last_conducted_date or drive.status in {"closed", "completed"})
@@ -491,6 +502,7 @@ def _drive_to_out(db: Session, drive: CertificationDrive) -> dict:
         "assessed_count": assessed_count,
         "passed_count": passed_count,
         "failed_count": failed_count,
+        "voucher_ready_count": voucher_ready_count,
         "voucher_count": voucher_count,
         "last_conducted_date": last_conducted_date,
         "can_conduct": can_conduct,
@@ -520,6 +532,20 @@ def _drives_to_out(db: Session, drives: list[CertificationDrive]) -> list[dict]:
         db.query(Voucher.drive_id, func.count(Voucher.id))
         .filter(Voucher.drive_id.in_(drive_ids))
         .group_by(Voucher.drive_id)
+        .all()
+    )
+    voucher_ready = dict(
+        db.query(Registration.drive_id, func.count(Registration.id))
+        .filter(
+            Registration.drive_id.in_(drive_ids),
+            Registration.status.in_([
+                RegistrationStatus.eligible,
+                RegistrationStatus.scheduled,
+                RegistrationStatus.assessed,
+                RegistrationStatus.passed,
+            ]),
+        )
+        .group_by(Registration.drive_id)
         .all()
     )
     last_assessed = dict(
@@ -598,6 +624,7 @@ def _drives_to_out(db: Session, drives: list[CertificationDrive]) -> list[dict]:
                 "assessed_count": assessed.get(drive.id, 0),
                 "passed_count": outcome_counts.get((drive.id, AssessmentOutcome.pass_), 0),
                 "failed_count": outcome_counts.get((drive.id, AssessmentOutcome.fail), 0),
+                "voucher_ready_count": voucher_ready.get(drive.id, 0),
                 "voucher_count": vouchers.get(drive.id, 0),
                 "last_conducted_date": last_conducted_date,
                 "can_conduct": can_conduct,

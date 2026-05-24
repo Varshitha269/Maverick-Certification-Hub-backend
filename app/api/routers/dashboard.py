@@ -104,7 +104,7 @@ def home_overview(db: Session = Depends(get_db), user: User = Depends(get_curren
             "Enroll and complete the generated prerequisite tasks.",
             "Upload required documents for admin review.",
             "Wait for approval and voucher assignment.",
-            "Download voucher, take the exam, and track results.",
+            # "Download voucher, take the exam, and track results.",
         ],
         "tool_stack": [
             {"name": "Azure OpenAI", "area": "Eligibility explanations, task plans, certificate verification"},
